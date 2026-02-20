@@ -52,7 +52,7 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from data_utils import create_dataloader, prepare_data
+from data_utils import create_dataloader, prepare_custom_data, prepare_data
 from model import ModelConfig, TinyLLM
 from tokenizer import BPETokenizer
 
@@ -67,7 +67,7 @@ class TrainConfig:
     dataset: str = "shakespeare"
     data_dir: str = "data"
     vocab_size: int = 4096
-    context_length: int = 256
+    context_length: int = 64
     val_fraction: float = 0.1
 
     # Model (kept small for learning/fast iteration)
@@ -296,12 +296,19 @@ def train(config: TrainConfig):
     # --- Data ---
     if master:
         print("\nPreparing data...")
-    train_ds, val_ds, tokenizer = prepare_data(
-        dataset_name=config.dataset,
+    # train_ds, val_ds, tokenizer = prepare_data(
+    #     dataset_name=config.dataset,
+    #     vocab_size=config.vocab_size,
+    #     context_length=config.context_length,
+    #     val_fraction=config.val_fraction,
+    #     data_dir=config.data_dir,
+    # )
+
+    train_ds, val_ds, tokenizer = prepare_custom_data(
+        json_path="./data/tinyllm_dataset.json",
         vocab_size=config.vocab_size,
         context_length=config.context_length,
         val_fraction=config.val_fraction,
-        data_dir=config.data_dir,
     )
 
     train_loader = create_dataloader(

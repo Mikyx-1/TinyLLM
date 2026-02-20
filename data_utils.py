@@ -1,16 +1,12 @@
 """
 Dataset utilities for language model training.
 
-We use TinyShakespeare as the default training corpus — a classic LLM
-learning dataset (~1MB, public domain). Easy to see results quickly.
-
-This module handles:
-- Downloading the dataset
-- Training the tokenizer on it
-- Creating PyTorch Dataset / DataLoader objects for training
-- Proper train/val splits
+Supports:
+- TinyShakespeare / Bible (plain text corpora)
+- Custom Q&A JSON format: [{"id": 1, "category": "...", "question": "...", "answer": "..."}, ...]
 """
 
+import json
 import os
 import urllib.request
 
@@ -33,6 +29,53 @@ DATASETS = {
     },
 }
 
+# ── Q&A formatting ────────────────────────────────────────────────────────────
+
+QA_TEMPLATE = "Question: {question}\nAnswer: {answer}"
+QA_SEPARATOR = "\n\n"  # separates individual Q&A pairs in the flat corpus
+
+
+def load_custom_json(path: str) -> str:
+    """
+    Load a custom Q&A JSON file and convert it to a flat training corpus.
+
+    Expected format:
+        [
+          {"id": 1, "category": "Identity", "question": "...", "answer": "..."},
+          ...
+        ]
+
+    Each entry is rendered as:
+        Question: <question>
+        Answer: <answer>
+
+    Entries are joined with a blank line so the tokenizer sees natural breaks.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError(f"Expected a JSON array at the top level, got {type(data)}")
+
+    pairs = []
+    for i, item in enumerate(data):
+        missing = [k for k in ("question", "answer") if k not in item]
+        if missing:
+            raise ValueError(f"Item {i} is missing required keys: {missing}")
+        pairs.append(
+            QA_TEMPLATE.format(
+                question=item["question"].strip(),
+                answer=item["answer"].strip(),
+            )
+        )
+
+    corpus = QA_SEPARATOR.join(pairs)
+    print(f"Loaded {len(pairs)} Q&A pairs → {len(corpus):,} characters")
+    return corpus
+
+
+# ── Original plain-text helpers (unchanged) ──────────────────────────────────
+
 
 def download_dataset(name: str = "shakespeare", data_dir: str = "data") -> str:
     """Download dataset if not already present."""
@@ -53,7 +96,6 @@ def download_dataset(name: str = "shakespeare", data_dir: str = "data") -> str:
     except Exception as e:
         print(f"  Download failed: {e}")
         print("  Creating a synthetic dataset for testing...")
-        # Fallback: create a small synthetic dataset
         _create_synthetic_dataset(path)
     return path
 
@@ -81,11 +123,14 @@ def _create_synthetic_dataset(path: str):
         "It blesseth him that gives and him that takes",
         "Neither a borrower nor a lender be",
         "For loan oft loses both itself and friend",
-    ] * 200  # Repeat to get reasonable corpus size
+    ] * 200
 
     with open(path, "w") as f:
         f.write("\n".join(lines))
     print(f"  Created synthetic dataset at {path}")
+
+
+# ── Dataset / DataLoader ──────────────────────────────────────────────────────
 
 
 class TokenizedDataset(Dataset):
@@ -100,9 +145,6 @@ class TokenizedDataset(Dataset):
         sample 0: input=[1,2,3,4], target=[2,3,4,5]
         sample 1: input=[2,3,4,5], target=[3,4,5,6]
         ...
-
-    This implements the "sliding window" approach — every position
-    in the dataset is used as a starting point.
     """
 
     def __init__(self, token_ids: list[int], context_length: int):
@@ -110,14 +152,55 @@ class TokenizedDataset(Dataset):
         self.context_length = context_length
 
     def __len__(self) -> int:
-        # Each sample needs context_length + 1 tokens (input + target)
         return len(self.data) - self.context_length
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         chunk = self.data[idx : idx + self.context_length + 1]
-        x = chunk[:-1]  # input:  tokens 0..T-1
-        y = chunk[1:]  # target: tokens 1..T  (shifted by 1)
+        x = chunk[:-1]
+        y = chunk[1:]
         return x, y
+
+
+# ── Pipeline helpers ──────────────────────────────────────────────────────────
+
+
+def _build_datasets(
+    text: str,
+    vocab_size: int,
+    context_length: int,
+    val_fraction: float,
+    tokenizer_path: str,
+    force_retrain_tokenizer: bool,
+) -> tuple["TokenizedDataset", "TokenizedDataset", BPETokenizer]:
+    """Shared tokenise → split → dataset logic used by both prepare functions."""
+    print(f"Corpus size: {len(text):,} characters")
+
+    if os.path.exists(tokenizer_path) and not force_retrain_tokenizer:
+        print(f"Loading existing tokenizer from {tokenizer_path}")
+        tokenizer = BPETokenizer.load(tokenizer_path)
+    else:
+        print(f"Training BPE tokenizer (vocab_size={vocab_size})...")
+        tokenizer = BPETokenizer()
+        tokenizer.train(text, vocab_size=vocab_size, verbose=True)
+        tokenizer.save(tokenizer_path)
+
+    print("Encoding corpus...")
+    token_ids = tokenizer.encode(text)
+    print(
+        f"Corpus encoded: {len(token_ids):,} tokens "
+        f"(compression: {len(text)/len(token_ids):.2f}x)"
+    )
+
+    split_idx = int(len(token_ids) * (1 - val_fraction))
+    train_ids = token_ids[:split_idx]
+    val_ids = token_ids[split_idx:]
+    print(f"Train tokens: {len(train_ids):,}, Val tokens: {len(val_ids):,}")
+
+    train_ds = TokenizedDataset(train_ids, context_length)
+    val_ds = TokenizedDataset(val_ids, context_length)
+    print(f"Train samples: {len(train_ds):,}, Val samples: {len(val_ds):,}")
+
+    return train_ds, val_ds, tokenizer
 
 
 def prepare_data(
@@ -128,49 +211,52 @@ def prepare_data(
     data_dir: str = "data",
     tokenizer_path: str = "data/tokenizer.json",
     force_retrain_tokenizer: bool = False,
-) -> tuple[TokenizedDataset, TokenizedDataset, BPETokenizer]:
+) -> tuple["TokenizedDataset", "TokenizedDataset", BPETokenizer]:
+    """Plain-text pipeline: download → tokenize → split → dataset objects."""
+    text_path = download_dataset(dataset_name, data_dir)
+    with open(text_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    return _build_datasets(
+        text,
+        vocab_size,
+        context_length,
+        val_fraction,
+        tokenizer_path,
+        force_retrain_tokenizer,
+    )
+
+
+def prepare_custom_data(
+    json_path: str,
+    vocab_size: int = 4096,
+    context_length: int = 256,
+    val_fraction: float = 0.1,
+    tokenizer_path: str = "data/tokenizer.json",
+    force_retrain_tokenizer: bool = False,
+) -> tuple["TokenizedDataset", "TokenizedDataset", BPETokenizer]:
     """
-    Full data pipeline: download -> tokenize -> split -> dataset objects.
+    Custom Q&A JSON pipeline: load JSON → format → tokenize → split → datasets.
+
+    Args:
+        json_path:   Path to your JSON file (list of Q&A dicts).
+        vocab_size:  BPE vocabulary size.
+        context_length: Sliding-window context length in tokens.
+        val_fraction:   Fraction of tokens held out for validation.
+        tokenizer_path: Where to save/load the trained tokenizer.
+        force_retrain_tokenizer: Re-train even if a saved tokenizer exists.
 
     Returns:
         train_dataset, val_dataset, tokenizer
     """
-    # 1. Download raw text
-    text_path = download_dataset(dataset_name, data_dir)
-    with open(text_path, "r", encoding="utf-8") as f:
-        text = f.read()
-    print(f"Corpus size: {len(text):,} characters")
-
-    # 2. Train or load tokenizer
-    if os.path.exists(tokenizer_path) and not force_retrain_tokenizer:
-        print(f"Loading existing tokenizer from {tokenizer_path}")
-        tokenizer = BPETokenizer.load(tokenizer_path)
-    else:
-        print(f"Training BPE tokenizer (vocab_size={vocab_size})...")
-        tokenizer = BPETokenizer()
-        tokenizer.train(text, vocab_size=vocab_size, verbose=True)
-        tokenizer.save(tokenizer_path)
-
-    # 3. Encode full corpus
-    print("Encoding corpus...")
-    token_ids = tokenizer.encode(text)
-    print(
-        f"Corpus encoded: {len(token_ids):,} tokens "
-        f"(compression: {len(text)/len(token_ids):.2f}x)"
+    text = load_custom_json(json_path)
+    return _build_datasets(
+        text,
+        vocab_size,
+        context_length,
+        val_fraction,
+        tokenizer_path,
+        force_retrain_tokenizer,
     )
-
-    # 4. Train / val split
-    split_idx = int(len(token_ids) * (1 - val_fraction))
-    train_ids = token_ids[:split_idx]
-    val_ids = token_ids[split_idx:]
-    print(f"Train tokens: {len(train_ids):,}, Val tokens: {len(val_ids):,}")
-
-    # 5. Create Dataset objects
-    train_ds = TokenizedDataset(train_ids, context_length)
-    val_ds = TokenizedDataset(val_ids, context_length)
-    print(f"Train samples: {len(train_ds):,}, Val samples: {len(val_ds):,}")
-
-    return train_ds, val_ds, tokenizer
 
 
 def create_dataloader(
@@ -182,22 +268,16 @@ def create_dataloader(
     rank: int = 0,
     world_size: int = 1,
 ) -> DataLoader:
-    """
-    Create a DataLoader, with optional DistributedSampler for multi-GPU.
-
-    With DDP (Distributed Data Parallel), each GPU processes a different
-    shard of the data. The DistributedSampler handles partitioning.
-    """
+    """Create a DataLoader, with optional DistributedSampler for multi-GPU."""
     sampler = None
     if distributed:
-        # Each process gets a non-overlapping subset of indices
         sampler = DistributedSampler(
             dataset,
             num_replicas=world_size,
             rank=rank,
             shuffle=shuffle,
         )
-        shuffle = False  # DistributedSampler handles shuffling
+        shuffle = False
 
     return DataLoader(
         dataset,
@@ -205,15 +285,25 @@ def create_dataloader(
         shuffle=shuffle,
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=True,  # Faster CPU->GPU transfer
-        drop_last=True,  # Drop incomplete last batch for consistency
+        pin_memory=True,
+        drop_last=True,
     )
 
 
+# ── Quick smoke-test ──────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    train_ds, val_ds, tok = prepare_data(vocab_size=2000, context_length=64)
+
+    train_ds, val_ds, tok = prepare_custom_data(
+        json_path="./data/tinyllm_dataset.json",
+        vocab_size=2000,
+        context_length=64,
+    )
+
     loader = create_dataloader(train_ds, batch_size=4)
     x, y = next(iter(loader))
     print(f"Batch x: {x.shape}, y: {y.shape}")
     print(f"Sample decode: '{tok.decode(x[0].tolist())}'")
+    print("\n")
+    print(f"GT decode: {tok.decode(y[0].tolist())}")
     print("Data pipeline OK ✓")
