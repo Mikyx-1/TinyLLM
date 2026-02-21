@@ -31,7 +31,14 @@ DATASETS = {
 
 # ── Q&A formatting ────────────────────────────────────────────────────────────
 
-QA_TEMPLATE = "Question: {question}\nAnswer: {answer}"
+# Each Q&A pair is wrapped with <BOS> ... <EOS> so the model learns:
+#   1. Where a conversation starts  (<BOS>)
+#   2. Where it ends                (<EOS>)
+#
+# Without <EOS> the model sees one giant stream of text and happily generates
+# the next question-answer pair after finishing an answer — exactly the
+# "ridiculous" behaviour you observed.
+QA_TEMPLATE = "<BOS> Question: {question}\nAnswer: {answer} <EOS>"
 QA_SEPARATOR = "\n\n"  # separates individual Q&A pairs in the flat corpus
 
 
@@ -46,10 +53,12 @@ def load_custom_json(path: str) -> str:
         ]
 
     Each entry is rendered as:
-        Question: <question>
-        Answer: <answer>
+        <BOS> Question: <question>
+        Answer: <answer> <EOS>
 
-    Entries are joined with a blank line so the tokenizer sees natural breaks.
+    The <BOS>/<EOS> markers teach the model where each exchange begins and
+    ends.  The tokenizer's encode() method recognises these as special tokens
+    and emits their dedicated ids rather than running them through BPE.
     """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -298,6 +307,7 @@ if __name__ == "__main__":
         json_path="./data/tinyllm_dataset.json",
         vocab_size=2000,
         context_length=64,
+        force_retrain_tokenizer=True,  # retrain so <BOS>/<EOS> are in the corpus
     )
 
     loader = create_dataloader(train_ds, batch_size=4)
@@ -306,4 +316,13 @@ if __name__ == "__main__":
     print(f"Sample decode: '{tok.decode(x[0].tolist())}'")
     print("\n")
     print(f"GT decode: {tok.decode(y[0].tolist())}")
+
+    # Verify special tokens are present and correctly roundtripped
+    test = "<BOS> What is your name? <EOS>"
+    enc = tok.encode(test)
+    assert tok.bos_id in enc, "<BOS> id missing from encoded output!"
+    assert tok.eos_id in enc, "<EOS> id missing from encoded output!"
+    print(
+        f"Special token check — BOS id {tok.bos_id} and EOS id {tok.eos_id} both present ✓"
+    )
     print("Data pipeline OK ✓")

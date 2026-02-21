@@ -98,7 +98,14 @@ class BPETokenizer:
         # Pretokenize: split on whitespace, treat each word as a sequence of chars
         # We add a special end-of-word marker '▁' (or we can use Ġ like GPT-2)
         # Here we use a simple space-prefix scheme: words get '▁' prefix
-        words = text.split()
+        #
+        # NOTE: We strip out special tokens from the raw text before training
+        # so they are never broken up by BPE — they live only in self.SPECIAL_TOKENS.
+        clean_text = text
+        for sp in self.SPECIAL_TOKENS:
+            clean_text = clean_text.replace(sp, " ")
+
+        words = clean_text.split()
         word_freq: dict[tuple, int] = defaultdict(int)
         for word in words:
             # Represent word as tuple of chars + end marker
@@ -186,22 +193,54 @@ class BPETokenizer:
         return symbols
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        """Encode text to token ids."""
-        words = text.split()
+        """
+        Encode text to token ids.
+
+        Special tokens (<BOS>, <EOS>, <PAD>, <UNK>) present in the text are
+        preserved as single tokens rather than being fed through BPE. This is
+        what allows data_utils to embed <BOS>/<EOS> boundary markers directly
+        in the corpus string and have them survive tokenisation intact.
+        """
         ids = []
         if add_special_tokens:
             ids.append(self.bos_id)
-        for word in words:
-            tokens = self._tokenize_word(word)
-            for tok in tokens:
-                ids.append(self.encoder.get(tok, self.unk_id))
+
+        # Split on special tokens first, keeping the delimiters in the result.
+        special_pattern = (
+            "(" + "|".join(re.escape(s) for s in self.SPECIAL_TOKENS) + ")"
+        )
+        segments = re.split(special_pattern, text)
+
+        for segment in segments:
+            if segment in self.encoder:
+                # It's a special token — emit its id directly.
+                ids.append(self.encoder[segment])
+            elif segment:
+                # Regular text — run normal BPE tokenisation.
+                for word in segment.split():
+                    tokens = self._tokenize_word(word)
+                    for tok in tokens:
+                        ids.append(self.encoder.get(tok, self.unk_id))
+
         if add_special_tokens:
             ids.append(self.eos_id)
         return ids
 
-    def decode(self, ids: list[int]) -> str:
-        """Decode token ids back to text."""
-        tokens = [self.decoder.get(i, "<UNK>") for i in ids]
+    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+        """
+        Decode token ids back to text.
+
+        Args:
+            ids: list of token ids.
+            skip_special_tokens: if True (default) special tokens are dropped
+                from the output string.  Set to False to see them explicitly.
+        """
+        tokens = []
+        for i in ids:
+            tok = self.decoder.get(i, "<UNK>")
+            if skip_special_tokens and tok in self.SPECIAL_TOKENS:
+                continue
+            tokens.append(tok)
         text = "".join(tokens)
         # Replace our word-boundary marker with spaces
         text = text.replace("▁", " ").strip()
@@ -236,7 +275,8 @@ if __name__ == "__main__":
     sample = "hello world this is a test hello world"
     tok = BPETokenizer()
     tok.train(sample, vocab_size=300, verbose=False)
-    ids = tok.encode("hello world")
+    ids = tok.encode("<BOS> hello world <EOS>")
     print(f"Encoded: {ids}")
-    print(f"Decoded: '{tok.decode(ids)}'")
+    print(f"Decoded (skip special): '{tok.decode(ids)}'")
+    print(f"Decoded (show special): '{tok.decode(ids, skip_special_tokens=False)}'")
     print("Tokenizer OK ✓")
