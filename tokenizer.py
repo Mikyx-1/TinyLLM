@@ -11,10 +11,8 @@ This is the same core algorithm used by GPT-2/GPT-4, just smaller.
 """
 
 import json
-import os
 import re
 from collections import defaultdict
-from typing import Optional
 
 
 def get_stats(vocab: dict[tuple, int]) -> dict[tuple, int]:
