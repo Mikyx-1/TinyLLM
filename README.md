@@ -151,7 +151,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 python train.py
 ```
 
-### Train (dual RTX 3060 — your setup!)
+### Train (dual GPUs)
 ```bash
 torchrun --nproc_per_node=2 train.py
 ```
