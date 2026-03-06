@@ -9,12 +9,8 @@ Key components built from scratch:
   - FeedForward (with GELU activation)
   - TransformerBlock (pre-norm: LayerNorm -> Attn -> residual, LayerNorm -> FFN -> residual)
   - PositionalEncoding (both learned and sinusoidal options)
+  - KV Cache
   - TinyLLM (full GPT-style decoder-only model)
-
-  [NEW] KV Cache:
-  - KVCache dataclass — stores K and V tensors per layer
-  - MultiHeadAttention.forward() accepts an optional cache and updates it in-place
-  - TinyLLM.generate() allocates one cache object and passes it through all layers
 
 Math notation in comments uses:
   B = batch size
@@ -67,34 +63,6 @@ class ModelConfig:
         head = self.d_model + self.vocab_size * self.d_model
         total = emb + pos + self.n_layers * block + head
         return total
-
-
-# ---------------------------------------------------------------------------
-# KV Cache
-# ---------------------------------------------------------------------------
-
-# ┌──────────────────────────────────────────────────────────────────────────┐
-# │  WHY KV CACHING?                                                         │
-# │                                                                          │
-# │  During autoregressive generation we produce one token at a time:        │
-# │    step 1: process "Hello"           → predict "world"                   │
-# │    step 2: process "Hello world"     → predict "!"                       │
-# │    step 3: process "Hello world !"   → predict "<eos>"                   │
-# │                                                                          │
-# │  Without caching, every step re-runs the full forward pass over ALL      │
-# │  previous tokens. That means O(T²) total work for a T-token sequence.    │
-# │                                                                          │
-# │  With KV caching, we observe that:                                       │
-# │    • The Keys and Values for past tokens never change between steps.     │
-# │    • Only the NEW token produces new K and V vectors.                    │
-# │                                                                          │
-# │  So we cache K and V from previous steps and only compute Q, K, V        │
-# │  for the single new token per step. Then we concatenate the new K/V      │
-# │  onto the cache before running attention.                                │
-# │                                                                          │
-# │  Result: each generation step becomes O(T) instead of O(T²).             │
-# │  For long sequences this is a huge win!                                  │
-# └──────────────────────────────────────────────────────────────────────────┘
 
 
 @dataclass
