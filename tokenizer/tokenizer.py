@@ -1,5 +1,5 @@
 """
-Byte Pair Encoding (BPE) Tokenizer — implemented from scratch.
+Byte Pair Encoding (BPE) Tokenizer.
 
 How BPE works:
 1. Start with a vocabulary of individual characters (bytes)
@@ -12,36 +12,9 @@ This is the same core algorithm used by GPT-2/GPT-4, just smaller.
 
 import json
 import re
-from collections import defaultdict
 
-
-def get_stats(vocab: dict[tuple, int]) -> dict[tuple, int]:
-    """Count frequency of every adjacent pair across all words."""
-    pairs = defaultdict(int)
-    for word, freq in vocab.items():
-        symbols = list(word)
-        for i in range(len(symbols) - 1):
-            pairs[(symbols[i], symbols[i + 1])] += freq
-    return pairs
-
-
-def merge_vocab(pair: tuple, vocab: dict[tuple, int]) -> dict[tuple, int]:
-    """Replace all occurrences of `pair` with a merged token."""
-    new_vocab = {}
-    bigram = pair  # e.g. ('h', 'e')
-    for word, freq in vocab.items():
-        new_word = []
-        i = 0
-        word_list = list(word)
-        while i < len(word_list):
-            if i < len(word_list) - 1 and (word_list[i], word_list[i + 1]) == bigram:
-                new_word.append(word_list[i] + word_list[i + 1])
-                i += 2
-            else:
-                new_word.append(word_list[i])
-                i += 1
-        new_vocab[tuple(new_word)] = freq
-    return new_vocab
+from .bpe_utils import get_stats, merge_vocab
+from .constants import SPECIAL_TOKENS, WORD_BOUNDARY
 
 
 class BPETokenizer:
@@ -55,7 +28,7 @@ class BPETokenizer:
         <EOS> - end of sequence
     """
 
-    SPECIAL_TOKENS = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
+    SPECIAL_TOKENS = SPECIAL_TOKENS
 
     def __init__(self):
         self.encoder: dict[str, int] = {}  # token -> id
@@ -63,60 +36,56 @@ class BPETokenizer:
         self.merges: list[tuple[str, str]] = []  # ordered merge rules
         self.vocab_size: int = 0
 
+    # ------------------------------------------------------------------
+    # Special-token id properties
+    # ------------------------------------------------------------------
+
     @property
-    def pad_id(self):
+    def pad_id(self) -> int:
         return self.encoder["<PAD>"]
 
     @property
-    def unk_id(self):
+    def unk_id(self) -> int:
         return self.encoder["<UNK>"]
 
     @property
-    def bos_id(self):
+    def bos_id(self) -> int:
         return self.encoder["<BOS>"]
 
     @property
-    def eos_id(self):
+    def eos_id(self) -> int:
         return self.encoder["<EOS>"]
 
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
     def train(self, text: str, vocab_size: int, verbose: bool = True):
-        """
-        Train BPE on raw text.
+        """Train BPE on raw text.
 
         Args:
-            text: raw training corpus
-            vocab_size: target vocabulary size
-            verbose: print merge progress
+            text: raw training corpus.
+            vocab_size: target vocabulary size.
+            verbose: print merge progress.
         """
         assert (
             vocab_size > len(self.SPECIAL_TOKENS) + 256
         ), "vocab_size must be > 260 to fit special tokens + base chars"
 
-        # --- Step 1: Build initial character vocabulary ---
-        # Pretokenize: split on whitespace, treat each word as a sequence of chars
-        # We add a special end-of-word marker '▁' (or we can use Ġ like GPT-2)
-        # Here we use a simple space-prefix scheme: words get '▁' prefix
-        #
-        # NOTE: We strip out special tokens from the raw text before training
-        # so they are never broken up by BPE — they live only in self.SPECIAL_TOKENS.
+        # Strip special tokens so they are never broken up by BPE merges.
         clean_text = text
         for sp in self.SPECIAL_TOKENS:
             clean_text = clean_text.replace(sp, " ")
 
-        words = clean_text.split()
+        # Pretokenize: each word becomes a tuple of chars with a boundary prefix.
+        from collections import defaultdict
+
         word_freq: dict[tuple, int] = defaultdict(int)
-        for word in words:
-            # Represent word as tuple of chars + end marker
-            token_word = tuple(list("▁" + word))
-            word_freq[token_word] += 1
+        for word in clean_text.split():
+            word_freq[tuple(WORD_BOUNDARY + word)] += 1
 
-        # Initial vocab: all unique characters
-        char_vocab: set[str] = set()
-        for word in word_freq:
-            for ch in word:
-                char_vocab.add(ch)
-
-        # Build encoder starting with special tokens, then chars
+        # Initial vocab: special tokens first, then all unique characters.
+        char_vocab: set[str] = {ch for word in word_freq for ch in word}
         idx = 0
         for sp in self.SPECIAL_TOKENS:
             self.encoder[sp] = idx
@@ -125,7 +94,7 @@ class BPETokenizer:
             self.encoder[ch] = idx
             idx += 1
 
-        # --- Step 2: BPE merge loop ---
+        # BPE merge loop.
         num_merges = vocab_size - len(self.encoder)
         vocab = dict(word_freq)
 
@@ -140,18 +109,13 @@ class BPETokenizer:
             if not pairs:
                 break
 
-            # Find most frequent pair
             best_pair = max(pairs, key=pairs.get)
             merged = best_pair[0] + best_pair[1]
 
-            # Record the merge rule
             self.merges.append(best_pair)
-
-            # Add merged token to vocab
             self.encoder[merged] = idx
             idx += 1
 
-            # Apply merge to corpus
             vocab = merge_vocab(best_pair, vocab)
 
             if verbose and (merge_idx + 1) % 500 == 0:
@@ -163,18 +127,21 @@ class BPETokenizer:
 
         self.vocab_size = len(self.encoder)
         self.decoder = {v: k for k, v in self.encoder.items()}
+
         if verbose:
             print(f"Training complete. Final vocab size: {self.vocab_size}")
 
+    # ------------------------------------------------------------------
+    # Encoding / decoding
+    # ------------------------------------------------------------------
+
     def _tokenize_word(self, word: str) -> list[str]:
         """Apply learned BPE merges to a single word."""
-        # Start: split into individual chars
-        symbols = list("▁" + word)
+        symbols = list(WORD_BOUNDARY + word)
 
-        # Apply merges in learned order
         for left, right in self.merges:
             i = 0
-            new_symbols = []
+            new_symbols: list[str] = []
             while i < len(symbols):
                 if (
                     i < len(symbols) - 1
@@ -191,33 +158,33 @@ class BPETokenizer:
         return symbols
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        """
-        Encode text to token ids.
+        """Encode text to token ids.
 
-        Special tokens (<BOS>, <EOS>, <PAD>, <UNK>) present in the text are
-        preserved as single tokens rather than being fed through BPE. This is
-        what allows data_utils to embed <BOS>/<EOS> boundary markers directly
-        in the corpus string and have them survive tokenisation intact.
+        Special tokens present in the text are preserved as single tokens
+        rather than being fed through BPE. This allows ``data_utils`` to embed
+        ``<BOS>``/``<EOS>`` boundary markers directly in the corpus string and
+        have them survive tokenisation intact.
+
+        Args:
+            text: input string to encode.
+            add_special_tokens: if True, prepend BOS and append EOS ids.
+
+        Returns:
+            List of integer token ids.
         """
-        ids = []
+        ids: list[int] = []
         if add_special_tokens:
             ids.append(self.bos_id)
 
-        # Split on special tokens first, keeping the delimiters in the result.
         special_pattern = (
             "(" + "|".join(re.escape(s) for s in self.SPECIAL_TOKENS) + ")"
         )
-        segments = re.split(special_pattern, text)
-
-        for segment in segments:
+        for segment in re.split(special_pattern, text):
             if segment in self.encoder:
-                # It's a special token — emit its id directly.
                 ids.append(self.encoder[segment])
             elif segment:
-                # Regular text — run normal BPE tokenisation.
                 for word in segment.split():
-                    tokens = self._tokenize_word(word)
-                    for tok in tokens:
+                    for tok in self._tokenize_word(word):
                         ids.append(self.encoder.get(tok, self.unk_id))
 
         if add_special_tokens:
@@ -225,13 +192,15 @@ class BPETokenizer:
         return ids
 
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
-        """
-        Decode token ids back to text.
+        """Decode token ids back to text.
 
         Args:
             ids: list of token ids.
             skip_special_tokens: if True (default) special tokens are dropped
-                from the output string.  Set to False to see them explicitly.
+                from the output string. Set to False to see them explicitly.
+
+        Returns:
+            Decoded string.
         """
         tokens = []
         for i in ids:
@@ -239,13 +208,14 @@ class BPETokenizer:
             if skip_special_tokens and tok in self.SPECIAL_TOKENS:
                 continue
             tokens.append(tok)
-        text = "".join(tokens)
-        # Replace our word-boundary marker with spaces
-        text = text.replace("▁", " ").strip()
-        return text
+        return "".join(tokens).replace(WORD_BOUNDARY, " ").strip()
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
 
     def save(self, path: str):
-        """Save tokenizer to JSON."""
+        """Save tokenizer state to a JSON file."""
         data = {
             "encoder": self.encoder,
             "merges": self.merges,
@@ -257,7 +227,7 @@ class BPETokenizer:
 
     @classmethod
     def load(cls, path: str) -> "BPETokenizer":
-        """Load tokenizer from JSON."""
+        """Load tokenizer state from a JSON file."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         tok = cls()
@@ -266,15 +236,3 @@ class BPETokenizer:
         tok.vocab_size = data["vocab_size"]
         tok.decoder = {int(v): k for k, v in tok.encoder.items()}
         return tok
-
-
-if __name__ == "__main__":
-    # Quick sanity check
-    sample = "hello world this is a test hello world"
-    tok = BPETokenizer()
-    tok.train(sample, vocab_size=300, verbose=False)
-    ids = tok.encode("<BOS> hello world <EOS>")
-    print(f"Encoded: {ids}")
-    print(f"Decoded (skip special): '{tok.decode(ids)}'")
-    print(f"Decoded (show special): '{tok.decode(ids, skip_special_tokens=False)}'")
-    print("Tokenizer OK ✓")
