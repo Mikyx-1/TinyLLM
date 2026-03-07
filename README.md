@@ -3,16 +3,6 @@
 > A minimal, heavily-commented GPT-style language model (~20M parameters) for learning purposes.
 > Every component is implemented from scratch — no HuggingFace, no pre-built transformers.
 
-```
-tinyllm/
-├── 🔤 tokenizer.py      # BPE tokenizer (from scratch)
-├── 🏗️  model.py          # Transformer architecture (from scratch)
-├── 📦 data_utils.py     # Data pipeline + PyTorch Dataset
-├── 🚀 train.py          # Multi-GPU training loop with DDP
-├── 💬 generate.py       # Text generation / inference
-└── 📋 requirements.txt
-```
-
 ---
 
 ## 📚 What You'll Learn
