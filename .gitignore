@@ -209,3 +209,6 @@ __marimo__/
 # Ignore saved weights
 *.pt
 *.pth
+
+# Ignore .zip files
+*.zip
