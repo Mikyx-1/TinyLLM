@@ -48,7 +48,7 @@ class PretrainConfig:
     corpus_dir: str = "data/tokenized"
     tokenizer_path: str = "checkpoints/tokenizer.json"
 
-    context_length: int = 256
+    context_length: int = 64
     d_model: int = 384
     n_heads: int = 6
     n_layers: int = 6

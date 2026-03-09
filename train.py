@@ -64,7 +64,7 @@ class TrainConfig:
     # Data
     dataset_path: str = "data/tinyllm_dataset.json"
     data_dir: str = "data"
-    vocab_size: int = 4096
+    vocab_size: int = 8000
     context_length: int = 64
     val_fraction: float = 0.1
 
@@ -244,14 +244,20 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str, model: nn.Module, optimizer=None):
-    """Load checkpoint and return iteration number."""
+    """Load checkpoint and return iteration number and saved model config."""
     checkpoint = torch.load(path, map_location="cpu")
     raw_model = model.module if isinstance(model, DDP) else model
-    raw_model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Handle checkpoints saved from torch.compile() — strip "_orig_mod." prefix
+    state_dict = checkpoint["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+    raw_model.load_state_dict(state_dict)
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     print(f"Resumed from checkpoint: {path} (iter={checkpoint['iter_num']})")
-    return checkpoint["iter_num"]
+    return checkpoint["iter_num"], checkpoint.get("model_config")
 
 
 # ---------------------------------------------------------------------------
@@ -320,19 +326,28 @@ def train(config: TrainConfig):
     )
 
     # --- Model ---
-    model_config = ModelConfig(
-        vocab_size=tokenizer.vocab_size,
-        context_length=config.context_length,
-        d_model=config.d_model,
-        n_heads=config.n_heads,
-        n_layers=config.n_layers,
-        d_ff=config.d_ff,
-        dropout=config.dropout,
-        use_learned_pos_emb=config.use_learned_pos_emb,
-    )
-
-    if master:
-        print(f"\nModel config: {model_config}")
+    # If resuming, use the checkpoint's saved model_config to ensure architecture match
+    if config.resume_from and os.path.exists(config.resume_from):
+        ckpt_meta = torch.load(config.resume_from, map_location="cpu")
+        saved_cfg = ckpt_meta.get("model_config", {})
+        # Remove computed fields that aren't constructor parameters
+        saved_cfg.pop("d_k", None)
+        model_config = ModelConfig(**saved_cfg)
+        if master:
+            print(f"\nModel config (from checkpoint): {model_config}")
+    else:
+        model_config = ModelConfig(
+            vocab_size=tokenizer.vocab_size,
+            context_length=config.context_length,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.n_layers,
+            d_ff=config.d_ff,
+            dropout=config.dropout,
+            use_learned_pos_emb=config.use_learned_pos_emb,
+        )
+        if master:
+            print(f"\nModel config: {model_config}")
 
     model = TinyLLM(model_config).to(device)
 
@@ -375,7 +390,7 @@ def train(config: TrainConfig):
     # --- Resume from checkpoint ---
     start_iter = 0
     if config.resume_from and os.path.exists(config.resume_from):
-        start_iter = load_checkpoint(config.resume_from, model, optimizer)
+        start_iter, _ = load_checkpoint(config.resume_from, model, optimizer)
 
     # --- Training loop ---
     if master:
