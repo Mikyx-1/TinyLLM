@@ -212,3 +212,12 @@ __marimo__/
 
 # Ignore .zip files
 *.zip
+
+# Pipeline data artifacts — reproducible via prepare_pipeline_data.py
+data/raw/
+data/raw_text/
+data/tokenized/
+data/sft_dataset.json
+data/reasoning_dataset.json
+data/preference_dataset.json
+checkpoints/

@@ -317,6 +317,7 @@ def evaluate(model, val_loader, eval_iters, device, ctx):
 
 def save_checkpoint(model, optimizer, step, val_loss, config, model_config, path):
     raw = model.module if isinstance(model, DDP) else model
+    raw = raw._orig_mod if hasattr(raw, "_orig_mod") else raw  # unwrap torch.compile
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(
         {

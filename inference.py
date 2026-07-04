@@ -16,7 +16,9 @@ from model.generate import generate
 from tokenizer import BPETokenizer
 
 
-def load_checkpoint(checkpoint_path: str, device: torch.device) -> tuple[TinyLLM, BPETokenizer]:
+def load_checkpoint(
+    checkpoint_path: str, device: torch.device, tokenizer_path: str | None = None
+) -> tuple[TinyLLM, BPETokenizer]:
     """Load model and tokenizer from a training checkpoint."""
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -27,8 +29,11 @@ def load_checkpoint(checkpoint_path: str, device: torch.device) -> tuple[TinyLLM
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    tok_path = checkpoint.get("train_config", {}).get("data_dir", "data") + "/tokenizer.json"
-    tokenizer = BPETokenizer.load(tok_path)
+    if tokenizer_path is None:
+        # train.py checkpoints carry "train_config"; pretrain.py's don't, so this falls
+        # back to the (usually wrong) default — pass --tokenizer_path explicitly for those.
+        tokenizer_path = checkpoint.get("train_config", {}).get("data_dir", "data") + "/tokenizer.json"
+    tokenizer = BPETokenizer.load(tokenizer_path)
 
     print(f"Params     : {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     print(f"Vocab size : {tokenizer.vocab_size}")
@@ -71,6 +76,8 @@ def run_inference(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate text with TinyLLM")
     parser.add_argument("--checkpoint",   type=str,   default="checkpoints/latest.pt")
+    parser.add_argument("--tokenizer_path", type=str, default=None,
+                         help="Override tokenizer path (required for pretrain.py checkpoints)")
     parser.add_argument("--prompt",       type=str,   default="To be or not to be")
     parser.add_argument("--max_tokens",   type=int,   default=200)
     parser.add_argument("--temperature",  type=float, default=0.8)
@@ -83,7 +90,7 @@ def main() -> None:
              if args.device == "auto" else torch.device(args.device)
     print(f"Device: {device}")
 
-    model, tokenizer = load_checkpoint(args.checkpoint, device)
+    model, tokenizer = load_checkpoint(args.checkpoint, device, tokenizer_path=args.tokenizer_path)
 
     result = run_inference(
         model, tokenizer,
