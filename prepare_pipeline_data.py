@@ -1,16 +1,23 @@
 """
 Stage 0 — Data & tokenizer prep for the full pretrain -> SFT -> reasoning -> reward model -> PPO pipeline.
 
-Downloads Alpaca, GSM8K, and Anthropic hh-rlhf (helpful-base), builds the per-stage dataset files, trains
-the ONE shared BPE tokenizer on the concatenation of all of them, and builds the plain-text corpus Stage 1
-(pretrain.py) trains on. Run once; every later stage resumes from files this script produces.
+Downloads Alpaca, Dolly-15k, GSM8K, and Anthropic hh-rlhf (helpful-base), builds the per-stage dataset
+files, trains the ONE shared BPE tokenizer on the concatenation of Alpaca+GSM8K+hh-rlhf, and builds the
+plain-text corpus Stage 1 (pretrain.py) trains on. Run once; every later stage resumes from files this
+script produces.
+
+Re-running is safe and cheap: downloads are skipped if already present, and by default the tokenizer is
+loaded rather than retrained if checkpoints/tokenizer.json already exists (pass --force_retrain_tokenizer
+to override) — so e.g. changing the SFT mix doesn't invalidate an existing pretrain checkpoint's vocab.
+Dolly is intentionally excluded from tokenizer training for this reason; it's plain English in the same
+register as Alpaca, so it encodes fine through the existing vocab.
 
 USAGE:
     python prepare_pipeline_data.py
 
 Outputs:
-    data/raw/{alpaca_data.json, gsm8k_train.jsonl, gsm8k_test.jsonl, hh_train.jsonl, hh_test.jsonl}
-    data/sft_dataset.json         — Alpaca subsample + existing tinyllm_dataset.json, {question, answer}
+    data/raw/{alpaca_data.json, dolly_15k.jsonl, gsm8k_train.jsonl, gsm8k_test.jsonl, hh_train.jsonl, hh_test.jsonl}
+    data/sft_dataset.json         — existing tinyllm_dataset.json + Alpaca subsample + Dolly-15k, {question, answer}
     data/reasoning_dataset.json   — GSM8K CoT, {question, reasoning, answer}
     data/preference_dataset.json  — hh-rlhf single-turn pairs, {prompt, chosen, rejected}
     data/raw_text/corpus.txt      — plain-text corpus for Stage 1 unsupervised pretraining
@@ -33,6 +40,7 @@ CALC_ANNOTATION_RE = re.compile(r"<<[^>]*>>")
 
 RAW_URLS = {
     "alpaca_data.json": "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json",
+    "dolly_15k.jsonl": "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/main/databricks-dolly-15k.jsonl",
     "gsm8k_train.jsonl": "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/train.jsonl",
     "gsm8k_test.jsonl": "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl",
     "hh_train.jsonl.gz": "https://huggingface.co/datasets/Anthropic/hh-rlhf/resolve/main/helpful-base/train.jsonl.gz",
@@ -59,6 +67,7 @@ class PipelineDataConfig:
     sft_subsample: int = 5_000
     preference_subsample: int = 8_000
     seed: int = 42
+    force_retrain_tokenizer: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -114,36 +123,43 @@ def read_jsonl(path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Alpaca -> SFT set
+# Step 2: Alpaca + Dolly-15k -> SFT set
 # ---------------------------------------------------------------------------
 
 
-def build_sft_dataset(cfg: PipelineDataConfig, alpaca_path: str) -> list[dict]:
-    print("Step 2: building SFT dataset from Alpaca")
+def build_sft_dataset(cfg: PipelineDataConfig, alpaca_path: str, dolly_path: str) -> list[dict]:
+    print("Step 2: building SFT dataset from Alpaca + Dolly-15k")
     with open(alpaca_path, "r", encoding="utf-8") as f:
         alpaca = json.load(f)
 
     rng = random.Random(cfg.seed)
-    sample = rng.sample(alpaca, min(cfg.sft_subsample, len(alpaca)))
+    alpaca_sample = rng.sample(alpaca, min(cfg.sft_subsample, len(alpaca)))
 
-    pairs = []
-    for row in sample:
+    alpaca_pairs = []
+    for row in alpaca_sample:
         question = row["instruction"].strip()
         if row.get("input"):
             question += "\n" + row["input"].strip()
-        pairs.append({"question": question, "answer": row["output"].strip()})
+        alpaca_pairs.append({"question": question, "answer": row["output"].strip()})
+
+    dolly_pairs = []
+    for row in read_jsonl(dolly_path):
+        question = row["instruction"].strip()
+        if row.get("context"):
+            question += "\n" + row["context"].strip()
+        dolly_pairs.append({"question": question, "answer": row["response"].strip()})
 
     with open(cfg.existing_sft_path, "r", encoding="utf-8") as f:
         existing = json.load(f)
     existing_pairs = [{"question": r["question"], "answer": r["answer"]} for r in existing]
 
-    dataset = existing_pairs + pairs
+    dataset = existing_pairs + alpaca_pairs + dolly_pairs
     out_path = os.path.join(cfg.data_dir, "sft_dataset.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(dataset, f, ensure_ascii=False, indent=2)
     print(
-        f"  Alpaca sampled: {len(pairs):,}  +  existing: {len(existing_pairs):,}"
-        f"  =  {len(dataset):,} total -> {out_path}"
+        f"  Identity: {len(existing_pairs):,}  +  Alpaca: {len(alpaca_pairs):,}"
+        f"  +  Dolly: {len(dolly_pairs):,}  =  {len(dataset):,} total -> {out_path}"
     )
     return dataset
 
@@ -267,6 +283,10 @@ def train_shared_tokenizer(
     reasoning_examples: list[dict],
     preference_pairs: list[dict],
 ) -> BPETokenizer:
+    if os.path.exists(cfg.tokenizer_path) and not cfg.force_retrain_tokenizer:
+        print(f"Step 5: loading existing tokenizer from {cfg.tokenizer_path} (pass --force_retrain_tokenizer to retrain)")
+        return BPETokenizer.load(cfg.tokenizer_path)
+
     print("Step 5: training shared BPE tokenizer on all 3 corpora")
     all_text = "\n".join(
         render_sft(sft_pairs) + render_reasoning(reasoning_examples) + render_preference(preference_pairs)
@@ -320,7 +340,7 @@ def build_pretrain_corpus(cfg: PipelineDataConfig, alpaca_path: str, gsm8k_train
 def main(cfg: PipelineDataConfig) -> None:
     raw_paths = download_all(cfg)
 
-    sft_pairs = build_sft_dataset(cfg, raw_paths["alpaca_data.json"])
+    sft_pairs = build_sft_dataset(cfg, raw_paths["alpaca_data.json"], raw_paths["dolly_15k.jsonl"])
     reasoning_examples = build_reasoning_dataset(cfg, raw_paths["gsm8k_train.jsonl"])
     preference_pairs = build_preference_dataset(cfg, raw_paths["hh_train.jsonl"])
 
@@ -341,6 +361,9 @@ if __name__ == "__main__":
     default = PipelineDataConfig()
     p = argparse.ArgumentParser()
     for k, v in default.__dict__.items():
-        p.add_argument(f"--{k}", type=type(v), default=v)
+        if isinstance(v, bool):
+            p.add_argument(f"--{k}", default=v, action="store_true")
+        else:
+            p.add_argument(f"--{k}", type=type(v), default=v)
     args = p.parse_args()
     main(PipelineDataConfig(**vars(args)))
