@@ -9,9 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.blocks import TransformerBlock
 from model.config import KVCache, ModelConfig, build_kv_cache
-from model.embeddings import build_positional_encoding
+from model.trunk import TransformerTrunk
 from model.types import LogitsAndLoss, OptionalCacheList
 
 
@@ -29,15 +28,9 @@ class TinyLLM(nn.Module):
         super().__init__()
         self.config = config
 
-        self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_emb = build_positional_encoding(config)
-        self.emb_dropout = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(config) for _ in range(config.n_layers)]
-        )
-        self.ln_final = nn.LayerNorm(config.d_model)
+        self.trunk = TransformerTrunk(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.lm_head.weight = self.token_emb.weight  # weight tying
+        self.lm_head.weight = self.trunk.token_emb.weight  # weight tying
 
         self._init_weights()
         n = sum(p.numel() for p in self.parameters())
@@ -70,19 +63,8 @@ class TinyLLM(nn.Module):
         caches: OptionalCacheList = None,
         start_pos: int = 0,
     ) -> LogitsAndLoss:
-        B, T = input_ids.shape
-        assert (
-            T + start_pos <= self.config.context_length
-        ), f"Total position {T + start_pos} exceeds context_length {self.config.context_length}"
-
-        x = self.emb_dropout(
-            self.token_emb(input_ids) + self.pos_emb(input_ids, start_pos)
-        )
-
-        for i, block in enumerate(self.blocks):
-            x = block(x, cache=caches[i] if caches is not None else None)
-
-        logits = self.lm_head(self.ln_final(x))
+        x = self.trunk(input_ids, caches=caches, start_pos=start_pos)
+        logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
