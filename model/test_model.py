@@ -24,6 +24,14 @@ def main() -> None:
     model = TinyLLM(cfg)
     model.eval()
 
+    # Trunk contract: RewardModel/ActorCritic will reuse TransformerTrunk and load
+    # these exact `trunk.*` keys from a TinyLLM checkpoint.
+    assert hasattr(model, "trunk"), "TinyLLM must expose a `trunk` submodule"
+    assert any(k.startswith("trunk.") for k in model.state_dict()), (
+        "state_dict keys must be prefixed with 'trunk.'"
+    )
+    print("Trunk contract OK ✓")
+
     # Forward pass
     x = torch.randint(0, cfg.vocab_size, (2, 64))
     logits, loss = model(x, targets=x)

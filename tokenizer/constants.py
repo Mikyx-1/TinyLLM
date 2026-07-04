@@ -6,4 +6,6 @@ Shared constants for the BPE tokenizer.
 WORD_BOUNDARY = "▁"
 
 # Special tokens — order matters: indices 0-3 are reserved for these.
-SPECIAL_TOKENS: list[str] = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
+# <THINK>/</THINK> (indices 4-5) wrap chain-of-thought reasoning traces so they get
+# dedicated tokens instead of being fragmented by BPE.
+SPECIAL_TOKENS: list[str] = ["<PAD>", "<UNK>", "<BOS>", "<EOS>", "<THINK>", "</THINK>"]
