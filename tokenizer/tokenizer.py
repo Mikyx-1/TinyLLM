@@ -34,6 +34,7 @@ class BPETokenizer:
         self.encoder: dict[str, int] = {}  # token -> id
         self.decoder: dict[int, str] = {}  # id -> token
         self.merges: list[tuple[str, str]] = []  # ordered merge rules
+        self.merge_ranks: dict[tuple[str, str], int] = {}  # merge -> position in self.merges
         self.vocab_size: int = 0
 
     # ------------------------------------------------------------------
@@ -127,6 +128,7 @@ class BPETokenizer:
 
         self.vocab_size = len(self.encoder)
         self.decoder = {v: k for k, v in self.encoder.items()}
+        self.merge_ranks = {pair: i for i, pair in enumerate(self.merges)}
 
         if verbose:
             print(f"Training complete. Final vocab size: {self.vocab_size}")
@@ -136,10 +138,29 @@ class BPETokenizer:
     # ------------------------------------------------------------------
 
     def _tokenize_word(self, word: str) -> list[str]:
-        """Apply learned BPE merges to a single word."""
+        """Apply learned BPE merges to a single word.
+
+        Rather than scanning the full ordered merge list (which was learned once over the whole
+        corpus and is only sparsely relevant to any one word), repeatedly find the adjacent pair
+        with the lowest rank (earliest-learned) that's actually present in the word and merge it.
+        This produces exactly the same result as applying the merges in order — a rank-N merge
+        can only ever create a pair for a rank-N+1 merge, so picking the lowest-rank pair present
+        at each step reproduces the same merge sequence — just skipping the merges that don't
+        apply to this word instead of checking each one explicitly.
+        """
         symbols = list(WORD_BOUNDARY + word)
 
-        for left, right in self.merges:
+        while len(symbols) > 1:
+            ranked_pairs = (
+                (self.merge_ranks[pair], pair)
+                for pair in zip(symbols, symbols[1:])
+                if pair in self.merge_ranks
+            )
+            best = min(ranked_pairs, default=None)
+            if best is None:
+                break
+            left, right = best[1]
+
             i = 0
             new_symbols: list[str] = []
             while i < len(symbols):
@@ -235,4 +256,5 @@ class BPETokenizer:
         tok.merges = [tuple(m) for m in data["merges"]]
         tok.vocab_size = data["vocab_size"]
         tok.decoder = {int(v): k for k, v in tok.encoder.items()}
+        tok.merge_ranks = {pair: i for i, pair in enumerate(tok.merges)}
         return tok
