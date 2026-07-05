@@ -14,6 +14,10 @@ HOW TO RUN:
 
     # 4. Resume:
     python pretrain.py --corpus_dir data/tokenized --resume_from checkpoints/pretrain/latest.pt
+
+    # 5. With Weights & Biases logging:
+    pip install wandb && wandb login
+    python pretrain.py --corpus_dir data/tokenized --use_wandb --wandb_project my-project
 """
 
 import argparse
@@ -37,6 +41,11 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from model import ModelConfig, TinyLLM
 from tokenizer import BPETokenizer
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -78,6 +87,10 @@ class PretrainConfig:
     compile: bool = True
     num_workers: int = 4
     seed: int = 42
+
+    use_wandb: bool = False
+    wandb_project: str = "tinyllm-pretrain"
+    wandb_run_name: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +421,16 @@ def pretrain(config: PretrainConfig):
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
+    if master and config.use_wandb:
+        if wandb is None:
+            raise RuntimeError("use_wandb=True but the `wandb` package is not installed. Run `pip install wandb`.")
+        wandb.init(
+            project=config.wandb_project,
+            name=config.wandb_run_name or None,
+            config={**config.__dict__, **model_config.__dict__},
+        )
+        wandb.watch(raw, log="gradients", log_freq=config.log_interval * 10)
+
     if master:
         eff = config.batch_size * config.grad_accumulation_steps * world_size
         print(
@@ -465,6 +488,16 @@ def pretrain(config: PretrainConfig):
             print(
                 f"{step+1:>8} | {lr:>10.2e} | {avg:>10.4f} | {math.exp(min(avg,20)):>8.1f} | {tok_count/dt:>10,.0f}"
             )
+            if config.use_wandb:
+                wandb.log(
+                    {
+                        "train/loss": avg,
+                        "train/ppl": math.exp(min(avg, 20)),
+                        "train/lr": lr,
+                        "train/tokens_per_sec": tok_count / dt,
+                    },
+                    step=step + 1,
+                )
             running_loss, tok_count, t0 = 0.0, 0, time.perf_counter()
 
         if master and (step + 1) % config.eval_interval == 0:
@@ -472,6 +505,14 @@ def pretrain(config: PretrainConfig):
             print(
                 f"{'VAL':>8} | {lr:>10.2e} | {val_loss:>10.4f} | {math.exp(min(val_loss,20)):>8.1f} |"
             )
+            if config.use_wandb:
+                wandb.log(
+                    {
+                        "val/loss": val_loss,
+                        "val/ppl": math.exp(min(val_loss, 20)),
+                    },
+                    step=step + 1,
+                )
             save_checkpoint(
                 model,
                 optimizer,
@@ -514,6 +555,8 @@ def pretrain(config: PretrainConfig):
             os.path.join(config.checkpoint_dir, "pretrain_final.pt"),
         )
         print("Done. Pass pretrain_final.pt to train.py via --resume_from.")
+        if config.use_wandb:
+            wandb.finish()
 
     if ddp:
         dist.destroy_process_group()

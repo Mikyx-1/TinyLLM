@@ -233,6 +233,16 @@ torchrun --nproc_per_node=2 train.py \
     --n_layers 8
 ```
 
+### Monitor training with Weights & Biases
+Both `train.py` (SFT) and `pretrain.py` support optional [W&B](https://wandb.ai) logging of train/val
+loss, perplexity, learning rate, tokens/sec, and gradients — off by default, opt in with `--use_wandb`.
+```bash
+pip install wandb
+wandb login
+python train.py --use_wandb --wandb_project tinyllm-sft --wandb_run_name my-run
+python pretrain.py --use_wandb --wandb_project tinyllm-pretrain
+```
+
 ### Generate text
 ```bash
 python generate.py \

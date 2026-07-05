@@ -221,3 +221,6 @@ data/sft_dataset.json
 data/reasoning_dataset.json
 data/preference_dataset.json
 checkpoints/
+
+# Weights & Biases local run logs
+wandb/

@@ -36,6 +36,10 @@ HOW TO RUN:
 
     With custom config:
         torchrun --nproc_per_node=2 train.py --batch_size 16 --max_iters 5000
+
+    With Weights & Biases logging:
+        pip install wandb && wandb login
+        python train.py --use_wandb --wandb_project my-project
 """
 
 import argparse
@@ -53,6 +57,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from data_utils import create_dataloader, prepare_custom_data
 from model import ModelConfig, TinyLLM
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 # ---------------------------------------------------------------------------
 # Training Configuration
@@ -108,6 +117,11 @@ class TrainConfig:
     dtype: str = "bfloat16"  # float32, float16, bfloat16
     compile: bool = False  # torch.compile (PyTorch 2.0+, faster but slower startup)
     num_workers: int = 4
+
+    # Monitoring
+    use_wandb: bool = False
+    wandb_project: str = "tinyllm-sft"
+    wandb_run_name: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +421,16 @@ def train(config: TrainConfig):
         else:
             start_iter, _ = load_checkpoint(config.resume_from, model, optimizer)
 
+    if master and config.use_wandb:
+        if wandb is None:
+            raise RuntimeError("use_wandb=True but the `wandb` package is not installed. Run `pip install wandb`.")
+        wandb.init(
+            project=config.wandb_project,
+            name=config.wandb_run_name or None,
+            config={**config.__dict__, **model_config.__dict__},
+        )
+        wandb.watch(raw_model, log="gradients", log_freq=config.log_interval * 10)
+
     # --- Training loop ---
     if master:
         print(f"\nStarting training for {config.max_iters} iterations...")
@@ -488,6 +512,16 @@ def train(config: TrainConfig):
                 f"{iter_num+1:>8} | {lr:>10.2e} | {avg_loss:>12.4f} | "
                 f"{'':>10} | {tokens_per_sec:>10,.0f} | {dt:>7.1f}s"
             )
+            if config.use_wandb:
+                wandb.log(
+                    {
+                        "train/loss": avg_loss,
+                        "train/lr": lr,
+                        "train/tokens_per_sec": tokens_per_sec,
+                        "train/grad_norm": grad_norm.item(),
+                    },
+                    step=iter_num + 1,
+                )
             running_loss = 0.0
             t0 = time.time()
 
@@ -495,6 +529,8 @@ def train(config: TrainConfig):
         if master and (iter_num + 1) % config.eval_interval == 0:
             val_loss = evaluate(model, val_loader, config.eval_iters, device, ctx)
             print(f"{'>>> VAL':>8} | {lr:>10.2e} | {'':>12} | {val_loss:>10.4f} |")
+            if config.use_wandb:
+                wandb.log({"val/loss": val_loss}, step=iter_num + 1)
 
             if val_loss < best_val:
                 best_val = val_loss
@@ -542,6 +578,8 @@ def train(config: TrainConfig):
         save_checkpoint(
             model, optimizer, config.max_iters, 0.0, config, model_config, final_path
         )
+        if config.use_wandb:
+            wandb.finish()
 
     cleanup_ddp(ddp)
 
