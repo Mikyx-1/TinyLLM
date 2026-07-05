@@ -161,7 +161,9 @@ class TokenizedDataset(Dataset):
         self.context_length = context_length
 
     def __len__(self) -> int:
-        return len(self.data) - self.context_length
+        # max(0, ...) so an empty (or shorter-than-context) split, e.g. val_fraction=0,
+        # reports a valid length instead of a negative one.
+        return max(0, len(self.data) - self.context_length)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         chunk = self.data[idx : idx + self.context_length + 1]

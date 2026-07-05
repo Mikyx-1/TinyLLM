@@ -346,6 +346,9 @@ def train(config: TrainConfig):
         num_workers=config.num_workers,
         distributed=False,  # Only master evaluates
     )
+    has_val = len(val_ds) > 0
+    if master and not has_val:
+        print("\nNo validation split (val_fraction=0) — tracking train loss instead.")
 
     # --- Model ---
     # If resuming, use the checkpoint's saved model_config to ensure architecture match
@@ -525,8 +528,8 @@ def train(config: TrainConfig):
             running_loss = 0.0
             t0 = time.time()
 
-        # --- Evaluation ---
-        if master and (iter_num + 1) % config.eval_interval == 0:
+        # --- Evaluation (only when a val split exists) ---
+        if master and has_val and (iter_num + 1) % config.eval_interval == 0:
             val_loss = evaluate(model, val_loader, config.eval_iters, device, ctx)
             print(f"{'>>> VAL':>8} | {lr:>10.2e} | {'':>12} | {val_loss:>10.4f} |")
             if config.use_wandb:
@@ -569,6 +572,37 @@ def train(config: TrainConfig):
                 config,
                 model_config,
                 latest_path,
+            )
+
+        # --- Periodic checkpointing when there's no val split ---
+        # No held-out signal to track "best" against, so track train loss instead.
+        if master and not has_val and (iter_num + 1) % config.checkpoint_interval == 0:
+            print(f"{'>>> CKPT':>8} | {lr:>10.2e} | {accum_loss:>12.4f} | {'':>10} |")
+            if config.use_wandb:
+                wandb.log({"train/checkpoint_loss": accum_loss}, step=iter_num + 1)
+
+            if accum_loss < best_val:
+                best_val = accum_loss
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    iter_num + 1,
+                    accum_loss,
+                    config,
+                    model_config,
+                    os.path.join(config.checkpoint_dir, "best.pt"),
+                )
+
+            ckpt_path = os.path.join(
+                config.checkpoint_dir, f"checkpoint_{iter_num+1:05d}.pt"
+            )
+            save_checkpoint(
+                model, optimizer, iter_num + 1, accum_loss, config, model_config, ckpt_path
+            )
+
+            latest_path = os.path.join(config.checkpoint_dir, "latest.pt")
+            save_checkpoint(
+                model, optimizer, iter_num + 1, accum_loss, config, model_config, latest_path
             )
 
     if master:
