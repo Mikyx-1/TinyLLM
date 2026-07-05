@@ -1,26 +1,30 @@
 """
 Stage 0 — Data & tokenizer prep for the full pretrain -> SFT -> reasoning -> reward model -> PPO pipeline.
 
-Downloads Alpaca, Dolly-15k, GSM8K, and Anthropic hh-rlhf (helpful-base), builds the per-stage dataset
-files, trains the ONE shared BPE tokenizer on the concatenation of Alpaca+GSM8K+hh-rlhf, and builds the
-plain-text corpus Stage 1 (pretrain.py) trains on. Run once; every later stage resumes from files this
-script produces.
+Downloads Alpaca, Dolly-15k, GSM8K, Anthropic hh-rlhf (helpful-base), and WikiText-2 (real Wikipedia
+prose, for actual world-knowledge exposure during pretraining — Alpaca+GSM8K text alone has essentially
+none), builds the per-stage dataset files, trains the ONE shared BPE tokenizer, and builds the plain-text
+corpus Stage 1 (pretrain.py) trains on. Run once; every later stage resumes from files this script produces.
 
 Re-running is safe and cheap: downloads are skipped if already present, and by default the tokenizer is
 loaded rather than retrained if checkpoints/tokenizer.json already exists (pass --force_retrain_tokenizer
 to override) — so e.g. changing the SFT mix doesn't invalidate an existing pretrain checkpoint's vocab.
 Dolly is intentionally excluded from tokenizer training for this reason; it's plain English in the same
-register as Alpaca, so it encodes fine through the existing vocab.
+register as Alpaca, so it encodes fine through the existing vocab. WikiText IS included in tokenizer
+training when --force_retrain_tokenizer is passed, since encyclopedic proper nouns/terms benefit from
+dedicated subword coverage and (unlike the Dolly case) there's no existing checkpoint to protect when
+you're intentionally retraining the tokenizer.
 
 USAGE:
-    python prepare_pipeline_data.py
+    python prepare_pipeline_data.py --force_retrain_tokenizer   # first run, or to fold in a new corpus
 
 Outputs:
-    data/raw/{alpaca_data.json, dolly_15k.jsonl, gsm8k_train.jsonl, gsm8k_test.jsonl, hh_train.jsonl, hh_test.jsonl}
+    data/raw/{alpaca_data.json, dolly_15k.jsonl, gsm8k_train.jsonl, gsm8k_test.jsonl, hh_train.jsonl,
+              hh_test.jsonl, wikitext2_train.txt}
     data/sft_dataset.json         — existing tinyllm_dataset.json + Alpaca subsample + Dolly-15k, {question, answer}
     data/reasoning_dataset.json   — GSM8K CoT, {question, reasoning, answer}
     data/preference_dataset.json  — hh-rlhf single-turn pairs, {prompt, chosen, rejected}
-    data/raw_text/corpus.txt      — plain-text corpus for Stage 1 unsupervised pretraining
+    data/raw_text/corpus.txt      — plain-text corpus (Alpaca+GSM8K+WikiText-2) for Stage 1 pretraining
     checkpoints/tokenizer.json    — shared BPE tokenizer, trained once, reused by every later stage
 """
 
@@ -37,6 +41,8 @@ from data_utils import QA_TEMPLATE
 from tokenizer import BPETokenizer
 
 CALC_ANNOTATION_RE = re.compile(r"<<[^>]*>>")
+WIKITEXT_ARTIFACT_RE = re.compile(r"\s+([.,!?;:)])")
+WIKITEXT_OPEN_PAREN_RE = re.compile(r"\(\s+")
 
 RAW_URLS = {
     "alpaca_data.json": "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json",
@@ -45,6 +51,7 @@ RAW_URLS = {
     "gsm8k_test.jsonl": "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl",
     "hh_train.jsonl.gz": "https://huggingface.co/datasets/Anthropic/hh-rlhf/resolve/main/helpful-base/train.jsonl.gz",
     "hh_test.jsonl.gz": "https://huggingface.co/datasets/Anthropic/hh-rlhf/resolve/main/helpful-base/test.jsonl.gz",
+    "wikitext2_train.txt": "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/train.txt",
 }
 
 REASONING_TEMPLATE = "<BOS> Question: {question}\n<THINK> {reasoning} </THINK>\nAnswer: {answer} <EOS>"
@@ -120,6 +127,28 @@ def read_jsonl(path: str) -> list[dict]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def clean_wikitext(text: str) -> str:
+    """Undo WikiText's tokenization artifacts: space-separated punctuation, "@-@"-style
+    escaped hyphens/periods/commas, and <unk> rare-word placeholders."""
+    text = text.replace("<unk>", " ")
+    text = text.replace(" @-@ ", "-").replace(" @.@ ", ".").replace(" @,@ ", ",")
+    text = WIKITEXT_ARTIFACT_RE.sub(r"\1", text)
+    text = WIKITEXT_OPEN_PAREN_RE.sub("(", text)
+    for suffix in ["'s", "'ll", "'re", "'ve", "'d", "'m", "n't"]:
+        text = text.replace(" " + suffix, suffix)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
+
+
+def load_wikitext_paragraphs(wikitext_path: str) -> list[str]:
+    with open(wikitext_path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    paragraphs = [p.strip() for p in clean_wikitext(raw).split("\n\n")]
+    return [p for p in paragraphs if p and not p.startswith("=")]
 
 
 # ---------------------------------------------------------------------------
@@ -282,14 +311,18 @@ def train_shared_tokenizer(
     sft_pairs: list[dict],
     reasoning_examples: list[dict],
     preference_pairs: list[dict],
+    wikitext_paragraphs: list[str],
 ) -> BPETokenizer:
     if os.path.exists(cfg.tokenizer_path) and not cfg.force_retrain_tokenizer:
         print(f"Step 5: loading existing tokenizer from {cfg.tokenizer_path} (pass --force_retrain_tokenizer to retrain)")
         return BPETokenizer.load(cfg.tokenizer_path)
 
-    print("Step 5: training shared BPE tokenizer on all 3 corpora")
+    print("Step 5: training shared BPE tokenizer on all corpora (incl. WikiText-2)")
     all_text = "\n".join(
-        render_sft(sft_pairs) + render_reasoning(reasoning_examples) + render_preference(preference_pairs)
+        render_sft(sft_pairs)
+        + render_reasoning(reasoning_examples)
+        + render_preference(preference_pairs)
+        + wikitext_paragraphs
     )
     tok = BPETokenizer()
     tok.train(all_text, vocab_size=cfg.vocab_size, verbose=True)
@@ -303,7 +336,12 @@ def train_shared_tokenizer(
 # ---------------------------------------------------------------------------
 
 
-def build_pretrain_corpus(cfg: PipelineDataConfig, alpaca_path: str, gsm8k_train_path: str) -> str:
+def build_pretrain_corpus(
+    cfg: PipelineDataConfig,
+    alpaca_path: str,
+    gsm8k_train_path: str,
+    wikitext_paragraphs: list[str],
+) -> str:
     print("Step 7: building plain-text corpus for Stage 1 pretraining")
     with open(alpaca_path, "r", encoding="utf-8") as f:
         alpaca = json.load(f)
@@ -320,6 +358,8 @@ def build_pretrain_corpus(cfg: PipelineDataConfig, alpaca_path: str, gsm8k_train
     for row in gsm8k:
         clean_answer = CALC_ANNOTATION_RE.sub("", row["answer"]).strip()
         chunks.append(row["question"].strip() + "\n" + clean_answer)
+
+    chunks.extend(wikitext_paragraphs)
 
     corpus = "\n\n".join(chunks)
     os.makedirs(cfg.corpus_dir, exist_ok=True)
@@ -343,11 +383,17 @@ def main(cfg: PipelineDataConfig) -> None:
     sft_pairs = build_sft_dataset(cfg, raw_paths["alpaca_data.json"], raw_paths["dolly_15k.jsonl"])
     reasoning_examples = build_reasoning_dataset(cfg, raw_paths["gsm8k_train.jsonl"])
     preference_pairs = build_preference_dataset(cfg, raw_paths["hh_train.jsonl"])
+    wikitext_paragraphs = load_wikitext_paragraphs(raw_paths["wikitext2_train.txt"])
+    print(f"  WikiText-2: {len(wikitext_paragraphs):,} paragraphs")
 
-    tokenizer = train_shared_tokenizer(cfg, sft_pairs, reasoning_examples, preference_pairs)
+    tokenizer = train_shared_tokenizer(
+        cfg, sft_pairs, reasoning_examples, preference_pairs, wikitext_paragraphs
+    )
     reasoning_examples = filter_reasoning_by_length(cfg, reasoning_examples, tokenizer)
 
-    build_pretrain_corpus(cfg, raw_paths["alpaca_data.json"], raw_paths["gsm8k_train.jsonl"])
+    build_pretrain_corpus(
+        cfg, raw_paths["alpaca_data.json"], raw_paths["gsm8k_train.jsonl"], wikitext_paragraphs
+    )
 
     print("\nDone.")
     print(f"  SFT dataset        : {len(sft_pairs):,} examples")
