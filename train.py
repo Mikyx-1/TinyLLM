@@ -64,6 +64,7 @@ class TrainConfig:
     # Data
     dataset_path: str = "data/tinyllm_dataset.json"
     data_dir: str = "data"
+    tokenizer_path: str = "data/tokenizer.json"
     vocab_size: int = 8000
     context_length: int = 64
     val_fraction: float = 0.1
@@ -99,6 +100,9 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 500
     resume_from: str = ""  # path to checkpoint to resume from
+    resume_weights_only: bool = False  # cross-stage init: load weights only, start fresh at iter 0
+    # with no optimizer state, instead of continuing resume_from's own iter count/optimizer
+    # (the latter is only correct when resuming an interrupted run of *this same* stage)
 
     # System
     dtype: str = "bfloat16"  # float32, float16, bfloat16
@@ -229,8 +233,9 @@ def save_checkpoint(
     path: str,
 ):
     """Save training state to disk."""
-    # Unwrap DDP if necessary
+    # Unwrap DDP and torch.compile's OptimizedModule if necessary
     raw_model = model.module if isinstance(model, DDP) else model
+    raw_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
     checkpoint = {
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -246,9 +251,11 @@ def save_checkpoint(
 def load_checkpoint(path: str, model: nn.Module, optimizer=None):
     """Load checkpoint and return iteration number and saved model config."""
     checkpoint = torch.load(path, map_location="cpu")
+    # Unwrap DDP and torch.compile's OptimizedModule so state dict keys line up regardless
+    # of whether the *target* model is compiled/DDP-wrapped and whether the *saved* one was.
     raw_model = model.module if isinstance(model, DDP) else model
+    raw_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
 
-    # Handle checkpoints saved from torch.compile() — strip "_orig_mod." prefix
     state_dict = checkpoint["model_state_dict"]
     if any(k.startswith("_orig_mod.") for k in state_dict):
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
@@ -306,6 +313,7 @@ def train(config: TrainConfig):
         vocab_size=config.vocab_size,
         context_length=config.context_length,
         val_fraction=config.val_fraction,
+        tokenizer_path=config.tokenizer_path,
     )
 
     train_loader = create_dataloader(
@@ -390,7 +398,14 @@ def train(config: TrainConfig):
     # --- Resume from checkpoint ---
     start_iter = 0
     if config.resume_from and os.path.exists(config.resume_from):
-        start_iter, _ = load_checkpoint(config.resume_from, model, optimizer)
+        if config.resume_weights_only:
+            loaded_iter, _ = load_checkpoint(config.resume_from, model, optimizer=None)
+            if master:
+                print(
+                    f"  (weights only — starting fresh at iter 0, ignoring source iter={loaded_iter})"
+                )
+        else:
+            start_iter, _ = load_checkpoint(config.resume_from, model, optimizer)
 
     # --- Training loop ---
     if master:
@@ -403,6 +418,7 @@ def train(config: TrainConfig):
     model.train()
     train_iter = iter(train_loader)
     running_loss = 0.0
+    best_val = float("inf")
     t0 = time.time()
 
     for iter_num in range(start_iter, config.max_iters):
@@ -479,6 +495,18 @@ def train(config: TrainConfig):
         if master and (iter_num + 1) % config.eval_interval == 0:
             val_loss = evaluate(model, val_loader, config.eval_iters, device, ctx)
             print(f"{'>>> VAL':>8} | {lr:>10.2e} | {'':>12} | {val_loss:>10.4f} |")
+
+            if val_loss < best_val:
+                best_val = val_loss
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    iter_num + 1,
+                    val_loss,
+                    config,
+                    model_config,
+                    os.path.join(config.checkpoint_dir, "best.pt"),
+                )
 
             # Save checkpoint
             if (iter_num + 1) % config.checkpoint_interval == 0:
