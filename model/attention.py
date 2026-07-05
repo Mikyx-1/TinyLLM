@@ -45,13 +45,22 @@ class MultiHeadAttention(nn.Module):
         K = self.W_k(x).view(B, T_new, self.n_heads, self.d_k).transpose(1, 2)
         V = self.W_v(x).view(B, T_new, self.n_heads, self.d_k).transpose(1, 2)
 
+        T_past = 0
         if cache is not None:
+            T_past = cache.k.shape[2] if cache.k is not None else 0
             K, V = cache.update(K, V)  # (B, H, T_past + T_new, dk)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
 
-        if cache is None:
-            scores = scores.masked_fill(self.causal_mask[:T_new, :T_new], float("-inf"))
+        # Cached past positions are unconditionally visible (they precede every new
+        # token); only the T_new new positions need masking against each other. This
+        # matters for prefill, where T_new > 1 new tokens are processed in one shot
+        # with a cache attached — a single decode step (T_new == 1) needs no mask.
+        if T_new > 1:
+            causal = self.causal_mask[:T_new, :T_new]
+            scores[..., :, T_past:] = scores[..., :, T_past:].masked_fill(
+                causal, float("-inf")
+            )
 
         attn = self.attn_dropout(F.softmax(scores, dim=-1))
         out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, T_new, C)
