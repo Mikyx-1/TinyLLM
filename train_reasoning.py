@@ -1,45 +1,25 @@
 """
-Multi-GPU Training with PyTorch DDP (Distributed Data Parallel)
+Stage 3 — Reasoning SFT.
 
-This is the main training script. It implements:
+Mirrors train.py's structure/loop (LR schedule, AdamW param groups, grad clip/accum,
+DDP, checkpointing) verbatim, per this repo's convention of one script per pipeline
+stage rather than a shared library. The two real differences from train.py:
 
-1. DDP Setup:
-   - Each GPU runs its own process
-   - Each process holds a full copy of the model
-   - Forward/backward pass happens on each GPU with its own data shard
-   - Gradients are all-reduced (averaged) across GPUs automatically
-   - This gives ~linear speedup with number of GPUs
-
-2. Learning Rate Schedule:
-   - Linear warmup: prevents instability at the start of training
-   - Cosine decay: smoothly decreases LR to minimum over training
-
-3. Gradient Clipping:
-   - Clips gradient norm to prevent exploding gradients
-   - Essential for transformers
-
-4. Mixed Precision Training (bfloat16/float16):
-   - Reduces memory usage by ~50%
-   - Speeds up matrix multiplications on modern GPUs
-   - Automatic loss scaling handles underflow
-
-5. Gradient Accumulation:
-   - Simulates larger batch sizes without more memory
-   - Instead of batch_size=64, do 8 steps of batch_size=8
+1. Data comes from data_utils.prepare_reasoning_data(), which holds out whole GSM8K
+   problems *before* concatenation (not a token-position val_fraction cut) -- the
+   point of this stage is measuring generalization to problems never seen at all, not
+   loss on a slice of the training stream. Held-out examples aren't touched during
+   training; eval_reasoning.py scores them separately with real generation.
+2. There is therefore no in-loop validation pass -- checkpointing tracks train loss,
+   same as train.py's no-val path (see train.py's `has_val` branch for that pattern;
+   here it's unconditional since there's never a token-level val split).
 
 HOW TO RUN:
-    Single GPU:
-        python train.py
-
-    Multi-GPU (2 GPUs):
-        torchrun --nproc_per_node=2 train.py
-
-    With custom config:
-        torchrun --nproc_per_node=2 train.py --batch_size 16 --max_iters 5000
+    python train_reasoning.py
+    python train_reasoning.py --max_iters 3000 --checkpoint_dir checkpoints/reasoning
 
     With Weights & Biases logging:
-        pip install wandb && wandb login
-        python train.py --use_wandb --wandb_project my-project
+        python train_reasoning.py --use_wandb --wandb_project my-project
 """
 
 import argparse
@@ -55,7 +35,7 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from data_utils import create_dataloader, prepare_custom_data
+from data_utils import create_dataloader, prepare_reasoning_data
 from model import ModelConfig, TinyLLM
 
 try:
@@ -71,19 +51,25 @@ except ImportError:
 @dataclass
 class TrainConfig:
     # Data
-    dataset_path: str = "data/tinyllm_dataset.json"
-    data_dir: str = "data"
-    tokenizer_path: str = "data/tokenizer.json"
-    vocab_size: int = 8000
-    context_length: int = 64
-    val_fraction: float = 0.1
+    dataset_path: str = "data/reasoning_dataset.json"
+    tokenizer_path: str = "checkpoints/tokenizer.json"
+    vocab_size: int = 12_002  # must match the resumed checkpoint's (resized for <CALC>)
+    context_length: int = 384
+    held_out: int = 200  # whole GSM8K problems excluded from training, for eval_reasoning.py
+    heldout_out_path: str = "data/reasoning_heldout.json"
+    seed: int = 42
 
-    # Model (kept small for learning/fast iteration)
-    d_model: int = 384
-    n_heads: int = 6
-    n_layers: int = 6
-    d_ff: int = 1536
-    dropout: float = 0.1
+    # Model architecture (d_model/n_heads/n_layers/d_ff/use_learned_pos_emb only take
+    # effect if NOT resuming from a checkpoint; dropout always applies -- see resume_from
+    # below, it has no learned parameters so it's always safe to override on resume).
+    d_model: int = 512
+    n_heads: int = 8
+    n_layers: int = 8
+    d_ff: int = 1024
+    dropout: float = 0.2  # raised from Stage 2's 0.1 (which wasn't even applying on
+    # resume until the fix above) -- first reasoning-SFT run hit train loss 0.099 by
+    # iter 2410/10000 while held-out accuracy stayed at chance: memorizing training
+    # reasoning chains rather than learning transferable arithmetic reasoning.
     use_learned_pos_emb: bool = True
 
     # Training
@@ -95,23 +81,22 @@ class TrainConfig:
     warmup_iters: int = 200
     min_lr: float = 1e-5
     max_lr: float = 3e-4
-    weight_decay: float = 0.1
+    weight_decay: float = 0.3  # raised from 0.1 for the same overfitting reason as
+    # dropout above -- this stage measures generalization to held-out problems, unlike
+    # the deliberate weight_decay=0 memorization run in Stage 2.
     grad_clip: float = 1.0
     beta1: float = 0.9
     beta2: float = 0.95
 
-    # Evaluation
-    eval_interval: int = 200
-    eval_iters: int = 50  # batches to average for val loss
+    # Logging
     log_interval: int = 10
 
     # Checkpointing
-    checkpoint_dir: str = "checkpoints"
+    checkpoint_dir: str = "checkpoints/reasoning"
     checkpoint_interval: int = 500
-    resume_from: str = ""  # path to checkpoint to resume from
-    resume_weights_only: bool = False  # cross-stage init: load weights only, start fresh at iter 0
-    # with no optimizer state, instead of continuing resume_from's own iter count/optimizer
-    # (the latter is only correct when resuming an interrupted run of *this same* stage)
+    resume_from: str = "checkpoints/sft_memorize_100k/final_calc_ready.pt"
+    resume_weights_only: bool = True  # cross-stage init: fresh optimizer/iter count,
+    # not a resumed-mid-run of this same stage
 
     # System
     dtype: str = "bfloat16"  # float32, float16, bfloat16
@@ -120,7 +105,7 @@ class TrainConfig:
 
     # Monitoring
     use_wandb: bool = False
-    wandb_project: str = "tinyllm-sft"
+    wandb_project: str = "tinyllm-reasoning"
     wandb_run_name: str = ""
 
 
@@ -135,15 +120,10 @@ def get_lr(iter_num: int, config: TrainConfig) -> float:
 
     Phase 1 (iter < warmup_iters): linear warmup from 0 to max_lr
     Phase 2 (iter >= warmup_iters): cosine decay from max_lr to min_lr
-
-    Warmup prevents large gradient updates at the start when weights
-    are random and loss landscape is chaotic.
     """
     if iter_num < config.warmup_iters:
-        # Linear warmup
         return config.max_lr * (iter_num + 1) / config.warmup_iters
 
-    # Cosine decay
     progress = (iter_num - config.warmup_iters) / (
         config.max_iters - config.warmup_iters
     )
@@ -158,26 +138,14 @@ def get_lr(iter_num: int, config: TrainConfig) -> float:
 
 
 def setup_ddp():
-    """
-    Initialize the distributed process group.
-
-    When launched with torchrun:
-    - RANK: global process rank (0 = master)
-    - LOCAL_RANK: rank on this node (maps to GPU index)
-    - WORLD_SIZE: total number of processes (= total GPUs)
-
-    When running single-GPU (python train.py):
-    - These env vars aren't set, so we use rank=0, world_size=1
-    """
     if "RANK" in os.environ:
-        dist.init_process_group(backend="nccl")  # NCCL is fastest for GPU-GPU comms
+        dist.init_process_group(backend="nccl")
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
         return rank, local_rank, world_size, True
     else:
-        # Single GPU / CPU
         rank, local_rank, world_size = 0, 0, 1
         if torch.cuda.is_available():
             torch.cuda.set_device(0)
@@ -194,46 +162,7 @@ def is_master(rank: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    val_loader,
-    eval_iters: int,
-    device: torch.device,
-    ctx,
-) -> float:
-    """
-    Estimate validation loss by averaging over eval_iters batches.
-    Uses @torch.no_grad() to skip gradient computation (saves memory/time).
-    """
-    model.eval()
-    total_loss = 0.0
-    count = 0
-
-    val_iter = iter(val_loader)
-    for _ in range(eval_iters):
-        try:
-            x, y = next(val_iter)
-        except StopIteration:
-            val_iter = iter(val_loader)
-            x, y = next(val_iter)
-
-        x, y = x.to(device), y.to(device)
-        with ctx:
-            _, loss = model(x, targets=y)
-        total_loss += loss.item()
-        count += 1
-
-    model.train()
-    return total_loss / count
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint Utilities
+# Checkpoint Utilities (identical to train.py's)
 # ---------------------------------------------------------------------------
 
 
@@ -241,32 +170,29 @@ def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     iter_num: int,
-    val_loss: float,
+    train_loss: float,
     config: TrainConfig,
     model_config: ModelConfig,
     path: str,
 ):
     """Save training state to disk."""
-    # Unwrap DDP and torch.compile's OptimizedModule if necessary
     raw_model = model.module if isinstance(model, DDP) else model
     raw_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
     checkpoint = {
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "iter_num": iter_num,
-        "val_loss": val_loss,
+        "val_loss": train_loss,  # field name kept for compatibility with load_checkpoint
         "train_config": config.__dict__,
         "model_config": model_config.__dict__,
     }
     torch.save(checkpoint, path)
-    print(f"  Checkpoint saved: {path} (iter={iter_num}, val_loss={val_loss:.4f})")
+    print(f"  Checkpoint saved: {path} (iter={iter_num}, train_loss={train_loss:.4f})")
 
 
 def load_checkpoint(path: str, model: nn.Module, optimizer=None):
     """Load checkpoint and return iteration number and saved model config."""
     checkpoint = torch.load(path, map_location="cpu")
-    # Unwrap DDP and torch.compile's OptimizedModule so state dict keys line up regardless
-    # of whether the *target* model is compiled/DDP-wrapped and whether the *saved* one was.
     raw_model = model.module if isinstance(model, DDP) else model
     raw_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
 
@@ -294,7 +220,7 @@ def train(config: TrainConfig):
 
     if master:
         print("=" * 60)
-        print("TinyLLM Training")
+        print("TinyLLM Reasoning SFT (Stage 3)")
         print("=" * 60)
         print(f"World size: {world_size} GPU(s)")
         print(f"Device: {device}")
@@ -304,9 +230,6 @@ def train(config: TrainConfig):
         )
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    # --- Mixed precision context ---
-    # bfloat16 is preferred on Ampere+ (RTX 3060 is Ampere ✓)
-    # It has the same dynamic range as float32 (no loss scaling needed)
     dtype_map = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -320,14 +243,16 @@ def train(config: TrainConfig):
 
     # --- Data ---
     if master:
-        print("\nPreparing data...")
+        print("\nPreparing reasoning data...")
 
-    train_ds, val_ds, tokenizer = prepare_custom_data(
+    train_ds, held_out_examples, tokenizer = prepare_reasoning_data(
         json_path=config.dataset_path,
         vocab_size=config.vocab_size,
         context_length=config.context_length,
-        val_fraction=config.val_fraction,
+        held_out=config.held_out,
+        seed=config.seed,
         tokenizer_path=config.tokenizer_path,
+        heldout_out_path=config.heldout_out_path,
     )
 
     train_loader = create_dataloader(
@@ -339,27 +264,22 @@ def train(config: TrainConfig):
         rank=rank,
         world_size=world_size,
     )
-    val_loader = create_dataloader(
-        val_ds,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        distributed=False,  # Only master evaluates
-    )
-    has_val = len(val_ds) > 0
-    if master and not has_val:
-        print("\nNo validation split (val_fraction=0) — tracking train loss instead.")
 
     # --- Model ---
     # If resuming, use the checkpoint's saved model_config to ensure architecture match
+    # (this also picks up the resized vocab_size=12002 from vocab_surgery, needed for <CALC>).
     if config.resume_from and os.path.exists(config.resume_from):
         ckpt_meta = torch.load(config.resume_from, map_location="cpu")
         saved_cfg = ckpt_meta.get("model_config", {})
-        # Remove computed fields that aren't constructor parameters
         saved_cfg.pop("d_k", None)
+        # Architecture (vocab_size, d_model, etc.) must match the checkpoint for weight
+        # loading to work, but dropout has no learned parameters -- it's always safe to
+        # use *this* run's value instead of silently inheriting the source checkpoint's
+        # (which is 0.0, since Stage 2 deliberately trained with no dropout to memorize).
+        saved_cfg["dropout"] = config.dropout
         model_config = ModelConfig(**saved_cfg)
         if master:
-            print(f"\nModel config (from checkpoint): {model_config}")
+            print(f"\nModel config (from checkpoint, dropout overridden to {config.dropout}): {model_config}")
     else:
         model_config = ModelConfig(
             vocab_size=tokenizer.vocab_size,
@@ -376,28 +296,24 @@ def train(config: TrainConfig):
 
     model = TinyLLM(model_config).to(device)
 
-    # Optional: torch.compile for ~20% speedup (requires PyTorch 2.0+)
     if config.compile:
         if master:
             print("Compiling model with torch.compile()...")
         model = torch.compile(model)
 
-    # Wrap in DDP (handles gradient sync automatically)
     if ddp:
         model = DDP(model, device_ids=[local_rank])
 
     # --- Optimizer ---
-    # Use AdamW with weight decay on weight matrices (not biases/layernorms)
-    # This is the standard optimizer for transformer LMs
     decay_params = []
     no_decay_params = []
     raw_model = model.module if ddp else model
     for name, param in raw_model.named_parameters():
         if param.requires_grad:
             if param.ndim >= 2:
-                decay_params.append(param)  # weight matrices
+                decay_params.append(param)
             else:
-                no_decay_params.append(param)  # biases, layernorm
+                no_decay_params.append(param)
 
     optimizer = torch.optim.AdamW(
         [
@@ -409,7 +325,6 @@ def train(config: TrainConfig):
         eps=1e-8,
     )
 
-    # Gradient scaler for float16 (not needed for bfloat16)
     scaler = GradScaler(enabled=(config.dtype == "float16"))
 
     # --- Resume from checkpoint ---
@@ -437,35 +352,27 @@ def train(config: TrainConfig):
     # --- Training loop ---
     if master:
         print(f"\nStarting training for {config.max_iters} iterations...")
-        print(
-            f"{'Iter':>8} | {'LR':>10} | {'Train Loss':>12} | {'Val Loss':>10} | {'Tokens/s':>10} | {'Time':>8}"
-        )
-        print("-" * 70)
+        print(f"{'Iter':>8} | {'LR':>10} | {'Train Loss':>12} | {'Tokens/s':>10} | {'Time':>8}")
+        print("-" * 60)
 
     model.train()
     train_iter = iter(train_loader)
     running_loss = 0.0
-    best_val = float("inf")
+    best_loss = float("inf")
     t0 = time.time()
 
     for iter_num in range(start_iter, config.max_iters):
-        # --- Update learning rate ---
         lr = get_lr(iter_num, config)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        # --- Gradient accumulation ---
-        # Accumulate gradients over multiple micro-batches before stepping optimizer
-        # This simulates a larger batch size without more memory
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
 
         for micro_step in range(config.grad_accumulation_steps):
-            # Get next batch
             try:
                 x, y = next(train_iter)
             except StopIteration:
-                # Reset sampler for new epoch (important for DDP)
                 if ddp and hasattr(train_loader.sampler, "set_epoch"):
                     train_loader.sampler.set_epoch(iter_num)
                 train_iter = iter(train_loader)
@@ -473,26 +380,19 @@ def train(config: TrainConfig):
 
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            # With DDP, only sync gradients on the last accumulation step
-            # This avoids expensive all-reduce on every micro-step
             sync_gradients = micro_step == config.grad_accumulation_steps - 1
             context = model.no_sync() if (ddp and not sync_gradients) else nullcontext()
 
             with context:
                 with ctx:
                     _, loss = model(x, targets=y)
-                # Scale loss by accumulation steps so gradients have the right magnitude
                 loss = loss / config.grad_accumulation_steps
                 accum_loss += loss.item()
                 scaler.scale(loss).backward()
 
-        # --- Gradient clipping ---
-        # Clips the global gradient norm to prevent exploding gradients
-        # Essential for transformers — without this, training can diverge suddenly
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
-        # --- Optimizer step ---
         scaler.step(optimizer)
         scaler.update()
 
@@ -513,7 +413,7 @@ def train(config: TrainConfig):
             avg_loss = running_loss / config.log_interval
             print(
                 f"{iter_num+1:>8} | {lr:>10.2e} | {avg_loss:>12.4f} | "
-                f"{'':>10} | {tokens_per_sec:>10,.0f} | {dt:>7.1f}s"
+                f"{tokens_per_sec:>10,.0f} | {dt:>7.1f}s"
             )
             if config.use_wandb:
                 wandb.log(
@@ -528,90 +428,31 @@ def train(config: TrainConfig):
             running_loss = 0.0
             t0 = time.time()
 
-        # --- Evaluation (only when a val split exists) ---
-        if master and has_val and (iter_num + 1) % config.eval_interval == 0:
-            val_loss = evaluate(model, val_loader, config.eval_iters, device, ctx)
-            print(f"{'>>> VAL':>8} | {lr:>10.2e} | {'':>12} | {val_loss:>10.4f} |")
-            if config.use_wandb:
-                wandb.log({"val/loss": val_loss}, step=iter_num + 1)
-
-            if val_loss < best_val:
-                best_val = val_loss
-                save_checkpoint(
-                    model,
-                    optimizer,
-                    iter_num + 1,
-                    val_loss,
-                    config,
-                    model_config,
-                    os.path.join(config.checkpoint_dir, "best.pt"),
-                )
-
-            # Save checkpoint
-            if (iter_num + 1) % config.checkpoint_interval == 0:
-                ckpt_path = os.path.join(
-                    config.checkpoint_dir, f"checkpoint_{iter_num+1:05d}.pt"
-                )
-                save_checkpoint(
-                    model,
-                    optimizer,
-                    iter_num + 1,
-                    val_loss,
-                    config,
-                    model_config,
-                    ckpt_path,
-                )
-
-            # Also save "best" and "latest"
-            latest_path = os.path.join(config.checkpoint_dir, "latest.pt")
-            save_checkpoint(
-                model,
-                optimizer,
-                iter_num + 1,
-                val_loss,
-                config,
-                model_config,
-                latest_path,
-            )
-
-        # --- Periodic checkpointing when there's no val split ---
-        # No held-out signal to track "best" against, so track train loss instead.
-        if master and not has_val and (iter_num + 1) % config.checkpoint_interval == 0:
-            print(f"{'>>> CKPT':>8} | {lr:>10.2e} | {accum_loss:>12.4f} | {'':>10} |")
+        # --- Periodic checkpointing ---
+        # No in-loop validation (see module docstring) -- held-out GSM8K problems are
+        # scored separately by eval_reasoning.py with real generation, not loss.
+        if master and (iter_num + 1) % config.checkpoint_interval == 0:
             if config.use_wandb:
                 wandb.log({"train/checkpoint_loss": accum_loss}, step=iter_num + 1)
 
-            if accum_loss < best_val:
-                best_val = accum_loss
+            if accum_loss < best_loss:
+                best_loss = accum_loss
                 save_checkpoint(
-                    model,
-                    optimizer,
-                    iter_num + 1,
-                    accum_loss,
-                    config,
-                    model_config,
+                    model, optimizer, iter_num + 1, accum_loss, config, model_config,
                     os.path.join(config.checkpoint_dir, "best.pt"),
                 )
 
-            ckpt_path = os.path.join(
-                config.checkpoint_dir, f"checkpoint_{iter_num+1:05d}.pt"
-            )
-            save_checkpoint(
-                model, optimizer, iter_num + 1, accum_loss, config, model_config, ckpt_path
-            )
+            ckpt_path = os.path.join(config.checkpoint_dir, f"checkpoint_{iter_num+1:05d}.pt")
+            save_checkpoint(model, optimizer, iter_num + 1, accum_loss, config, model_config, ckpt_path)
 
             latest_path = os.path.join(config.checkpoint_dir, "latest.pt")
-            save_checkpoint(
-                model, optimizer, iter_num + 1, accum_loss, config, model_config, latest_path
-            )
+            save_checkpoint(model, optimizer, iter_num + 1, accum_loss, config, model_config, latest_path)
 
     if master:
         print("\nTraining complete!")
-        # Save final model
         final_path = os.path.join(config.checkpoint_dir, "final.pt")
-        save_checkpoint(
-            model, optimizer, config.max_iters, 0.0, config, model_config, final_path
-        )
+        save_checkpoint(model, optimizer, config.max_iters, 0.0, config, model_config, final_path)
+        print(f"\nHeld-out examples for eval_reasoning.py: {config.heldout_out_path}")
         if config.use_wandb:
             wandb.finish()
 
@@ -624,9 +465,8 @@ def train(config: TrainConfig):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train TinyLLM")
+    parser = argparse.ArgumentParser(description="Train TinyLLM reasoning SFT (Stage 3)")
     cfg = TrainConfig()
-    # Add all config fields as CLI arguments
     for key, val in cfg.__dict__.items():
         if isinstance(val, bool):
             parser.add_argument(f"--{key}", default=val, action="store_true")

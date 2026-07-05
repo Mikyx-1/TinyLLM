@@ -219,7 +219,12 @@ data/raw_text/
 data/tokenized/
 data/sft_dataset.json
 data/reasoning_dataset.json
+data/reasoning_heldout.json
 data/preference_dataset.json
+# Synthetic reasoning data -- reproducible via generate_synthetic_reasoning.py
+data/synthetic_reasoning_dataset.json
+data/synthetic_reasoning_3hop.json
+data/synthetic_reasoning_heldout.json
 checkpoints/
 
 # Weights & Biases local run logs

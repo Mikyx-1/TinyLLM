@@ -37,10 +37,16 @@ import re
 import urllib.request
 from dataclasses import dataclass
 
-from data_utils import QA_TEMPLATE
+from data_utils import QA_TEMPLATE, REASONING_TEMPLATE
 from tokenizer import BPETokenizer
 
 CALC_ANNOTATION_RE = re.compile(r"<<[^>]*>>")
+# GSM8K's own annotations are already "<<expr=result>>" -- capture expr/result so the
+# reasoning dataset can turn them into <CALC>expr</CALC>result instead of discarding them.
+# The literal result text right after (already present in GSM8K's prose) is left as-is;
+# at inference, generate() intercepts </CALC> and overwrites it with the real computed
+# value rather than trusting the model's own guess for those digits.
+CALC_TO_TAG_RE = re.compile(r"<<([^=<>]+)=([^>]*)>>")
 WIKITEXT_ARTIFACT_RE = re.compile(r"\s+([.,!?;:)])")
 WIKITEXT_OPEN_PAREN_RE = re.compile(r"\(\s+")
 
@@ -54,7 +60,9 @@ RAW_URLS = {
     "wikitext2_train.txt": "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/train.txt",
 }
 
-REASONING_TEMPLATE = "<BOS> Question: {question}\n<THINK> {reasoning} </THINK>\nAnswer: {answer} <EOS>"
+# REASONING_TEMPLATE now lives in data_utils.py (imported above) so train_reasoning.py's
+# tokenization and this script's length-filtering always agree on the exact same format.
+#
 # Same template the reward model / PPO policy will use in Stage 4-5, so the tokenizer already
 # covers that surface form.
 PREFERENCE_TEMPLATE = "<BOS> Question: {prompt}\nAnswer: {response} <EOS>"
@@ -204,10 +212,14 @@ def build_reasoning_dataset(cfg: PipelineDataConfig, gsm8k_train_path: str) -> l
 
     examples = []
     for row in rows:
-        clean_answer = CALC_ANNOTATION_RE.sub("", row["answer"])
-        if "\n#### " not in clean_answer:
+        # GSM8K's raw text already writes the literal result right after the
+        # annotation (e.g. "48/2 = <<48/2=24>>24 clips"), so the replacement only
+        # needs to open/close the tag -- reinserting the captured result would
+        # duplicate it.
+        tagged_answer = CALC_TO_TAG_RE.sub(r"<CALC>\1</CALC>", row["answer"])
+        if "\n#### " not in tagged_answer:
             continue
-        reasoning, final_number = clean_answer.split("\n#### ", 1)
+        reasoning, final_number = tagged_answer.split("\n#### ", 1)
         examples.append(
             {
                 "question": row["question"].strip(),

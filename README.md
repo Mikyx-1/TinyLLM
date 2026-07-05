@@ -5,6 +5,19 @@
 
 ---
 
+## 🎬 Demo
+
+![TinyLLM demo: instruction SFT and reasoning with live calculator tool-use](assets/tinyllm_demo.gif)
+
+Two real, unedited checkpoints from this repo's pipeline:
+- **Stage 2 (instruction SFT)** — exact-match recall against the training set.
+- **Stage 3 (reasoning SFT)** — chain-of-thought answers on held-out (unseen-number) word
+  problems, with a live `<CALC>` calculator tool-call: the model decides *when* and *what* to
+  compute, and the actual arithmetic result is injected for real rather than guessed — see
+  `model/calculator.py` and `model/generate.py`.
+
+---
+
 ## 📚 What You'll Learn
 
 ### 🔤 1. BPE Tokenization (`tokenizer.py`)
