@@ -219,6 +219,7 @@ data/raw_text/
 data/tokenized/
 data/sft_dataset.json
 data/reasoning_dataset.json
+data/reasoning_heldout.json
 data/preference_dataset.json
 checkpoints/
 

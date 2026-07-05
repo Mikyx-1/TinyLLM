@@ -8,6 +8,7 @@ Supports:
 
 import json
 import os
+import random
 import urllib.request
 
 import torch
@@ -40,6 +41,11 @@ DATASETS = {
 # "ridiculous" behaviour you observed.
 QA_TEMPLATE = "<BOS> Question: {question}\nAnswer: {answer} <EOS>"
 QA_SEPARATOR = "\n\n"  # separates individual Q&A pairs in the flat corpus
+
+# CoT reasoning format: <THINK> wraps the trace so it's dropped from a plain
+# answer-only reading, and any <CALC>expr</CALC> inside it is a live calculator call
+# (see model/generate.py) rather than plain text.
+REASONING_TEMPLATE = "<BOS> Question: {question}\n<THINK> {reasoning} </THINK>\nAnswer: {answer} <EOS>"
 
 
 def load_custom_json(path: str) -> str:
@@ -268,6 +274,62 @@ def prepare_custom_data(
         tokenizer_path,
         force_retrain_tokenizer,
     )
+
+
+def prepare_reasoning_data(
+    json_path: str,
+    vocab_size: int = 12_000,
+    context_length: int = 384,
+    held_out: int = 200,
+    seed: int = 42,
+    tokenizer_path: str = "checkpoints/tokenizer.json",
+    force_retrain_tokenizer: bool = False,
+    heldout_out_path: str = "data/reasoning_heldout.json",
+) -> tuple["TokenizedDataset", list[dict], BPETokenizer]:
+    """
+    GSM8K reasoning JSON pipeline: load {question, reasoning, answer} -> hold out
+    `held_out` whole examples -> render the rest as CoT text -> tokenize -> sliding-
+    window train dataset.
+
+    Deliberately NOT val_fraction (a token-position cut through one concatenated
+    corpus, as prepare_custom_data uses for pure-memorization SFT runs): the point of
+    this stage is measuring whether the model can solve problems it never saw a
+    single token of, so whole examples must be removed *before* concatenation, not
+    sliced out of the middle of a shared token stream where a held-out problem's
+    tokens could still leak into a training window.
+
+    The held-out set is deterministic (fixed seed, examples loaded in file order) and
+    written to `heldout_out_path` so eval_reasoning.py reads the exact same examples
+    without re-deriving the split.
+
+    Returns:
+        train_dataset, held_out_examples (raw dicts, unrendered), tokenizer
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        examples: list[dict] = json.load(f)
+
+    shuffled = examples[:]
+    random.Random(seed).shuffle(shuffled)
+    held_out_examples = shuffled[:held_out]
+    train_examples = shuffled[held_out:]
+
+    with open(heldout_out_path, "w", encoding="utf-8") as f:
+        json.dump(held_out_examples, f, ensure_ascii=False, indent=2)
+    print(
+        f"Reasoning data: {len(train_examples):,} training examples, "
+        f"{len(held_out_examples)} held out -> {heldout_out_path}"
+    )
+
+    text = "\n\n".join(REASONING_TEMPLATE.format(**ex) for ex in train_examples)
+    train_ds, _, tokenizer = _build_datasets(
+        text,
+        vocab_size,
+        context_length,
+        val_fraction=0.0,
+        tokenizer_path=tokenizer_path,
+        force_retrain_tokenizer=force_retrain_tokenizer,
+    )
+    return train_ds, held_out_examples, tokenizer
 
 
 def create_dataloader(
