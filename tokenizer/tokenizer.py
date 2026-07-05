@@ -28,9 +28,10 @@ class BPETokenizer:
         <EOS> - end of sequence
     """
 
-    SPECIAL_TOKENS = SPECIAL_TOKENS
-
     def __init__(self):
+        # Per-instance copy: add_special_tokens() mutates this, and must not leak into
+        # the shared module-level default or other instances.
+        self.SPECIAL_TOKENS: list[str] = list(SPECIAL_TOKENS)
         self.encoder: dict[str, int] = {}  # token -> id
         self.decoder: dict[int, str] = {}  # id -> token
         self.merges: list[tuple[str, str]] = []  # ordered merge rules
@@ -56,6 +57,34 @@ class BPETokenizer:
     @property
     def eos_id(self) -> int:
         return self.encoder["<EOS>"]
+
+    # ------------------------------------------------------------------
+    # Extending an already-trained tokenizer
+    # ------------------------------------------------------------------
+
+    def add_special_tokens(self, tokens: list[str]) -> list[int]:
+        """Append new special tokens after the current vocab, preserving every existing id.
+
+        Lets a model add e.g. <CALC>/</CALC> after pretraining without invalidating any
+        checkpoint's embedding table — pair with model/vocab_surgery.py to grow the
+        embedding rows to match. Tokens already present keep their existing id (idempotent).
+
+        Returns:
+            The id assigned to each token, in the same order as `tokens`.
+        """
+        ids = []
+        for tok in tokens:
+            if tok in self.encoder:
+                ids.append(self.encoder[tok])
+                continue
+            new_id = len(self.encoder)
+            self.encoder[tok] = new_id
+            self.decoder[new_id] = tok
+            if tok not in self.SPECIAL_TOKENS:
+                self.SPECIAL_TOKENS.append(tok)
+            ids.append(new_id)
+        self.vocab_size = len(self.encoder)
+        return ids
 
     # ------------------------------------------------------------------
     # Training
