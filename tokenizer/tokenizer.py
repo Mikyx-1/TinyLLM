@@ -58,6 +58,17 @@ class BPETokenizer:
     def eos_id(self) -> int:
         return self.encoder["<EOS>"]
 
+    @property
+    def im_start_id(self) -> int:
+        return self.encoder["<|im_start|>"]
+
+    @property
+    def im_end_id(self) -> int:
+        """ChatML message delimiter -- also the token generation should stop on after an
+        assistant message (pass as generate()'s eos_id when sampling from a
+        multi-turn-trained checkpoint; plain <EOS> never appears in that format)."""
+        return self.encoder["<|im_end|>"]
+
     # ------------------------------------------------------------------
     # Extending an already-trained tokenizer
     # ------------------------------------------------------------------
