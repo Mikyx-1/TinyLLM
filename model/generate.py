@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -27,6 +27,7 @@ def generate(
     eos_id: Optional[int] = None,
     tokenizer: Optional["BPETokenizer"] = None,
     calc_ids: Optional[tuple[int, int]] = None,
+    on_token: Optional[Callable[[int], None]] = None,
 ) -> torch.Tensor:  # (B, T_prompt + n_generated)
     """
     Generate up to max_new_tokens tokens using KV caching.
@@ -40,6 +41,13 @@ def generate(
     when to call the calculator and with what expression, not the arithmetic itself.
     Calculator interception only supports batch size 1 (each row would need its own
     result and its own injected length, which needs padding not implemented here).
+
+    Pass `on_token` to observe generation as it happens (e.g. to stream partial output
+    over a socket) -- called once per token actually appended to input_ids, in order,
+    including calculator-injected result tokens. Not called for a fallback token that
+    a bad/unmatched <CALC> expression discards (see _inject_calc_result) since that
+    token never ends up in the returned tensor either -- on_token mirrors exactly what
+    ships in the return value, nothing more.
     """
     model.eval()
     caches: CacheList = build_kv_cache(model.config.n_layers)
@@ -53,6 +61,8 @@ def generate(
     cur_len = input_ids.shape[1]
     next_token = sample(logits[:, -1, :], temperature, top_k, top_p)
     input_ids = torch.cat([input_ids, next_token], dim=1)
+    if on_token is not None:
+        on_token(next_token.item())
 
     for step in range(max_new_tokens):
         if eos_id is not None and (next_token == eos_id).all():
@@ -60,7 +70,7 @@ def generate(
         if use_calc and next_token.item() == calc_close_id and cur_len < model.config.context_length:
             input_ids, caches, next_token, cur_len = _inject_calc_result(
                 model, tokenizer, input_ids, caches, calc_open_id, cur_len,
-                temperature, top_k, top_p,
+                temperature, top_k, top_p, on_token,
             )
             continue
         if cur_len >= model.config.context_length:
@@ -70,6 +80,8 @@ def generate(
         cur_len += 1
         next_token = sample(logits[:, -1, :], temperature, top_k, top_p)
         input_ids = torch.cat([input_ids, next_token], dim=1)
+        if on_token is not None:
+            on_token(next_token.item())
 
     return input_ids
 
@@ -84,6 +96,7 @@ def _inject_calc_result(
     temperature: float,
     top_k: Optional[int],
     top_p: Optional[float],
+    on_token: Optional[Callable[[int], None]] = None,
 ) -> tuple[torch.Tensor, CacheList, torch.Tensor, int]:
     """Called right after a </CALC> token was sampled (appended to input_ids, not yet
     fed through the model / not yet in the cache). Feeds the close tag through the
@@ -121,6 +134,11 @@ def _inject_calc_result(
     logits, _ = model(result_tensor, caches=caches, start_pos=cur_len)
     cur_len += len(result_ids)  # result_ids are now cached; next_token (below) is not yet
     input_ids = torch.cat([input_ids, result_tensor], dim=1)
+    if on_token is not None:
+        for result_id in result_ids:
+            on_token(result_id)
     next_token = sample(logits[:, -1, :], temperature, top_k, top_p)
     input_ids = torch.cat([input_ids, next_token], dim=1)
+    if on_token is not None:
+        on_token(next_token.item())
     return input_ids, caches, next_token, cur_len

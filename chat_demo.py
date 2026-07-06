@@ -27,6 +27,7 @@ USAGE:
 """
 
 import argparse
+from typing import Callable, Optional
 
 import torch
 
@@ -117,6 +118,7 @@ def generate_reply(
     max_new_tokens: int = 40,
     temperature: float = 0.0,
     top_k: int = 1,
+    on_token: Optional[Callable[[int], None]] = None,
 ) -> dict:
     """Generate one assistant reply given the running prompt text and a new question.
 
@@ -134,6 +136,10 @@ def generate_reply(
         ready to feed back in as prompt_so_far for the next turn.
     Shared by run_chat's CLI loop and webchat.py's HTTP handler so the two entry points
     can't drift out of sync on prompt formatting.
+
+    Pass `on_token` (see model.generate.generate) to observe tokens as they're
+    generated -- e.g. webchat.py uses this to stream partial text to the browser
+    instead of blocking until the full reply is done.
     """
     eos_id = tokenizer.eos_id if format == "qa" else tokenizer.im_end_id
     prompt = prompt_so_far + _format_question(format, question)
@@ -147,7 +153,7 @@ def generate_reply(
     x = torch.tensor([ids], dtype=torch.long, device=device)
     out = generate(
         model, x, max_new_tokens=min(max_new_tokens, budget), temperature=temperature,
-        top_k=top_k, eos_id=eos_id,
+        top_k=top_k, eos_id=eos_id, on_token=on_token,
     )
     gen_ids = out[0, len(ids):].tolist()
     full_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()

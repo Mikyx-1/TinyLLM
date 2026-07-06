@@ -1,7 +1,7 @@
 """
 Synthetic arithmetic word-problem generator -- an easier reasoning task than GSM8K.
 
-GSM8K diagnosis (see PLAN.md / Stage 3 discussion): the model's arithmetic is fine once
+GSM8K diagnosis (Stage 3 discussion): the model's arithmetic is fine once
 it calls <CALC> (verified correct every time), but it fails to correctly extract which
 quantities/operations apply from highly diverse, free-form multi-sentence problems --
 that's the actual bottleneck, not calculation. This generator isolates that variable:
