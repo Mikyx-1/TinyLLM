@@ -180,19 +180,58 @@ async function send() {
       }),
     });
     if (!resp.ok) {
+      // Only malformed requests (empty message, bad JSON) fail before the stream
+      // starts -- see webchat.py's do_POST. Once streaming begins the response is
+      // always 200; a generation-time failure arrives as an {"error": ...} line below.
       const errText = await resp.text();
       pending.textContent = 'Error: ' + errText;
       pending.classList.remove('pending');
       pending.classList.add('err');
       return;
     }
-    const data = await resp.json();
-    renderBotContent(pending, data.answer, data.reasoning);
+
+    // Server streams newline-delimited JSON: {"delta": "..."} per token as it's
+    // generated, then one final {"done": true, answer, reasoning, full}. Render each
+    // delta into the pending bubble as plain growing text -- token by token, the same
+    // way the model actually produces it -- and only reformat into the collapsed
+    // "Thoughts" + answer layout once the final line arrives.
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let streamed = '';
+    let started = false;
+    let final = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        const evt = JSON.parse(line);
+        if (evt.error) {
+          throw new Error(evt.error);
+        } else if (evt.delta) {
+          if (!started) { pending.textContent = ''; started = true; }
+          streamed += evt.delta;
+          pending.textContent = streamed;
+          log.scrollTop = log.scrollHeight;
+        } else if (evt.done) {
+          final = evt;
+        }
+      }
+    }
+    if (!final) throw new Error('stream ended unexpectedly');
+
+    renderBotContent(pending, final.answer, final.reasoning);
     pending.classList.remove('pending');
     // Persist the full text (reasoning included), not the display-only answer -- the
     // server rebuilds context from this on the next request, and the model was
     // trained to condition on its own reasoning trace as part of its prior turn.
-    history.push({ question: text, answer: data.full });
+    history.push({ question: text, answer: final.full });
   } catch (e) {
     pending.textContent = 'Request failed: ' + e;
     pending.classList.remove('pending');

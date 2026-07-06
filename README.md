@@ -34,7 +34,6 @@ not as a prerequisite for anything in this repo to work.
 
 ## 📑 Table of Contents
 
-- [Demo](#-demo)
 - [Chat UI](#️-chat-ui)
 - [What You'll Learn](#-what-youll-learn)
 - [Datasets & Data Pipeline](#-datasets--data-pipeline)
@@ -45,9 +44,9 @@ not as a prerequisite for anything in this repo to work.
 
 ---
 
-## 🎬 Demo
+## 🖥️ Chat UI
 
-![TinyLLM demo: a live browser chat session with a 50M-param checkpoint handling small talk and a held-out word problem with live calculator tool-use, ChatML-style](assets/tinyllm_webchat_demo.gif)
+![TinyLLM webchat UI: a live browser chat session with a 50M-param checkpoint handling small talk and a held-out word problem with live calculator tool-use, ChatML-style](assets/tinyllm_webchat_demo.gif)
 
 This is a real, unedited session in `webchat.py` against a 50M-param checkpoint
 (`train_reasoning.py --dataset_format chatml`) trained jointly on multi-turn small talk and
@@ -66,18 +65,13 @@ arithmetic result injected rather than guessed (`model/calculator.py`, `model/ge
 — and renders as a collapsible "Thoughts" section, Claude/ChatGPT-style, instead of inline
 with the answer.
 
----
-
-## 🖥️ Chat UI
-
-![TinyLLM webchat UI: a small-talk exchange followed by a held-out word problem, with the Thoughts trace expanded](assets/tinyllm_webchat_screenshot.png)
-
 Once you have a checkpoint, there are two ways to talk to it:
 
 - **`chat_demo.py`** — CLI demo that feeds a fixed sequence of questions to prove the
   pipeline works end-to-end.
 - **`webchat.py`** — a real chat UI in your browser, for typing arbitrary follow-ups
-  yourself and watching the *live* answer come back:
+  yourself and watching the answer stream in token by token, the same way a real LLM
+  actually generates:
 
 ```bash
 python webchat.py \
@@ -88,12 +82,19 @@ python webchat.py \
 ```
 
 It's a tiny stdlib-only HTTP server (no extra `pip install` beyond training) serving a
-static chat page. It's **stateless by design**: the browser resends the full conversation
-history with every request and the server rebuilds the prompt from scratch each time —
-the same mechanic real chat APIs use, and it means what you see is exactly what the model
-does with the conversation so far, not some server-side memory trick. On a reasoning-capable
-checkpoint, any `<THINK>...</THINK>` trace is pulled out and rendered as a collapsible
-"Thoughts" section, Claude/ChatGPT-style, instead of inline with the answer.
+static chat page. `/chat` streams newline-delimited JSON as generation proceeds —
+`model/generate.py`'s `on_token` hook fires once per token actually appended to the
+sequence, so the browser renders each token as it's produced instead of blocking until
+the whole reply is ready. It's **stateless by design**: the browser resends the full
+conversation history with every request and the server rebuilds the prompt from scratch
+each time — the same mechanic real chat APIs use, and it means what you see is exactly
+what the model does with the conversation so far, not some server-side memory trick.
+
+This model is small enough to generate a full reply in well under a second on either
+CPU or GPU — much faster than real LLM APIs, whose pace is normally set by network +
+far larger model compute. The GIF above was recorded with `--stream_delay_ms 70`, an
+artificial per-token pause meant for demos/recordings; it defaults to `0` (as fast as
+the model actually generates) for real use.
 
 ---
 
@@ -272,7 +273,7 @@ learn:
 
 Both feed `train_reasoning.py --dataset_format chatml`, which pools chat and reasoning
 conversations as equals through `data_utils.prepare_multitask_data` — see the
-[Demo](#-demo) section above for what that checkpoint can do.
+[Chat UI](#️-chat-ui) section above for what that checkpoint can do.
 
 ### Bring your own data
 
