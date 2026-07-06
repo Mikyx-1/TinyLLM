@@ -21,9 +21,9 @@ Two prompt formats, matching whichever pipeline the checkpoint was trained with:
 USAGE:
     python chat_demo.py --checkpoint checkpoints/smalltalk_demo_v2/final.pt \\
         --turns "Hello" "Can you tell me a joke?"
-    python chat_demo.py --checkpoint checkpoints/multiturn_chatml_test/final.pt \\
-        --tokenizer_path data/tokenizer_multiturn_chatml.json --format chatml \\
-        --turns "Hello" "Can you tell me a joke?"
+    python chat_demo.py --checkpoint checkpoints/multitask_chatml/final.pt \\
+        --tokenizer_path checkpoints/tokenizer.json --format chatml \\
+        --turns "Hello" "A store has 8 boxes of pens, 6 pens per box. It sells 15. How many pens are left?"
 """
 
 import argparse
@@ -69,6 +69,44 @@ def render_prompt_prefix(format: str, history: list[tuple[str, str]]) -> str:
     return prompt
 
 
+def _strip_answer_prefix(text: str) -> str:
+    """Cosmetic only: REASONING_TEMPLATE/reasoning_example_to_conversation always
+    render the final answer as literal "Answer: {answer}" text -- strip that label for
+    display so a reasoning reply doesn't read "Answer: 12" in the chat bubble, the way
+    ChatGPT/Claude just show the answer itself."""
+    return text[len("Answer:"):].strip() if text.startswith("Answer:") else text
+
+
+def _split_reasoning(tokenizer: BPETokenizer, gen_ids: list[int]) -> tuple[str | None, str]:
+    """Split generated token ids into (reasoning_or_None, answer_text).
+
+    Splits on token ids, not decoded text -- decode(skip_special_tokens=True) drops
+    the <THINK>/</THINK> tags entirely, which would leave no marker in the string to
+    split on. Whether a <THINK>...</THINK> block is present at all is content-dependent
+    (reasoning_example_to_conversation embeds one; ordinary chat turns never have one),
+    so this returns (None, full_text) whenever there's no complete block -- including a
+    reasoning attempt that got cut off before closing the tag, since a half-formed
+    split is worse than just showing everything as the answer.
+    """
+    think_start_id = tokenizer.encoder.get("<THINK>")
+    think_end_id = tokenizer.encoder.get("</THINK>")
+    if (
+        think_start_id is not None
+        and think_end_id is not None
+        and think_start_id in gen_ids
+        and think_end_id in gen_ids
+    ):
+        start = gen_ids.index(think_start_id)
+        end = gen_ids.index(think_end_id)
+        if end > start:
+            reasoning = tokenizer.decode(gen_ids[start + 1 : end], skip_special_tokens=True).strip()
+            answer = _strip_answer_prefix(
+                tokenizer.decode(gen_ids[end + 1 :], skip_special_tokens=True).strip()
+            )
+            return reasoning, answer
+    return None, _strip_answer_prefix(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
+
+
 def generate_reply(
     model: TinyLLM,
     tokenizer: BPETokenizer,
@@ -79,13 +117,23 @@ def generate_reply(
     max_new_tokens: int = 40,
     temperature: float = 0.0,
     top_k: int = 1,
-) -> tuple[str, str]:
+) -> dict:
     """Generate one assistant reply given the running prompt text and a new question.
 
-    Returns (answer, updated_prompt) -- updated_prompt is prompt_so_far with this
-    turn's question and generated answer appended, ready to feed back in as
-    prompt_so_far for the next turn. Shared by run_chat's CLI loop and webchat.py's
-    HTTP handler so the two entry points can't drift out of sync on prompt formatting.
+    Returns {"answer", "reasoning", "full", "prompt"}:
+      - answer: user-facing text with any <THINK>...</THINK> trace stripped out, meant
+        for a Claude/ChatGPT-style collapsed "thoughts" section instead of showing the
+        reasoning trace inline with the final answer.
+      - reasoning: the <THINK>...</THINK> trace when the model chose to reason for this
+        turn (None for ordinary chat turns -- see _split_reasoning).
+      - full: the complete generated text, reasoning included -- what the model was
+        actually trained to condition on, so callers must use *this* (not `answer`)
+        when persisting turn history for a future request's context, or the model
+        would lose its own reasoning trace from the transcript it conditions on.
+      - prompt: prompt_so_far with this turn's question and `full` answer appended,
+        ready to feed back in as prompt_so_far for the next turn.
+    Shared by run_chat's CLI loop and webchat.py's HTTP handler so the two entry points
+    can't drift out of sync on prompt formatting.
     """
     eos_id = tokenizer.eos_id if format == "qa" else tokenizer.im_end_id
     prompt = prompt_so_far + _format_question(format, question)
@@ -93,14 +141,17 @@ def generate_reply(
     ids = tokenizer.encode(prompt)
     budget = model.config.context_length - len(ids) - 2
     if budget <= 0:
-        return "(context full; stopping)", prompt
+        msg = "(context full; stopping)"
+        return {"answer": msg, "reasoning": None, "full": msg, "prompt": prompt}
 
     x = torch.tensor([ids], dtype=torch.long, device=device)
     out = generate(
         model, x, max_new_tokens=min(max_new_tokens, budget), temperature=temperature,
         top_k=top_k, eos_id=eos_id,
     )
-    answer = tokenizer.decode(out[0, len(ids):].tolist(), skip_special_tokens=True).strip()
+    gen_ids = out[0, len(ids):].tolist()
+    full_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+    reasoning, answer = _split_reasoning(tokenizer, gen_ids)
     if format == "qa":
         # The QA-template model was trained exclusively on exactly-2-turn examples, so
         # it tends to keep going and hallucinate a second Question:/Answer: pair of its
@@ -110,12 +161,13 @@ def generate_reply(
         # (This tokenizer's decode collapses newlines to spaces, so the split looks for
         # " Question:", not the literal "\nQuestion:" that appears in the training text
         # before encoding.)
+        full_text = full_text.split(" Question:")[0].strip()
         answer = answer.split(" Question:")[0].strip()
     # chatml stops on <|im_end|> after every turn (see encode_conversation), so no
     # equivalent post-hoc truncation should be needed there.
 
-    prompt += _format_answer(format, answer)
-    return answer, prompt
+    prompt += _format_answer(format, full_text)
+    return {"answer": answer, "reasoning": reasoning, "full": full_text, "prompt": prompt}
 
 
 def run_chat(
@@ -134,16 +186,19 @@ def run_chat(
     prompt = "<BOS> " if format == "qa" else ""
     results = []
     for question in turns:
-        answer, prompt = generate_reply(
+        result = generate_reply(
             model, tokenizer, device, prompt, question, format,
             max_new_tokens, temperature, top_k,
         )
-        if answer == "(context full; stopping)":
-            print(answer)
+        prompt = result["prompt"]
+        if result["answer"] == "(context full; stopping)":
+            print(result["answer"])
             break
         print(f"You:     {question}")
-        print(f"TinyLLM: {answer}")
-        results.append((question, answer))
+        if result["reasoning"]:
+            print(f"  [thoughts] {result['reasoning']}")
+        print(f"TinyLLM: {result['answer']}")
+        results.append((question, result["answer"]))
 
     return results
 

@@ -50,6 +50,20 @@
   .row.bot .bubble { background: var(--bubble-bot); color: var(--bubble-bot-text); border-bottom-left-radius: 4px; }
   .row.bot .bubble.pending { color: var(--muted); font-style: italic; }
   .row.bot .bubble.err { background: #ff453a; color: white; }
+  .thoughts { margin-bottom: 8px; }
+  .thoughts summary {
+    cursor: pointer; font-size: 12px; color: var(--muted); list-style: none;
+    display: inline-flex; align-items: center; gap: 4px; user-select: none;
+  }
+  .thoughts summary::-webkit-details-marker { display: none; }
+  .thoughts summary::before {
+    content: '▸'; display: inline-block; font-size: 10px; transition: transform .15s;
+  }
+  .thoughts[open] summary::before { transform: rotate(90deg); }
+  .thoughts-content {
+    margin-top: 6px; padding: 6px 10px; border-left: 2px solid var(--border);
+    font-size: 12.5px; color: var(--muted); white-space: pre-wrap; word-wrap: break-word;
+  }
   footer {
     border-top: 1px solid var(--border); background: var(--panel); padding: 10px 12px;
     display: flex; gap: 8px; align-items: flex-end;
@@ -100,7 +114,8 @@ const resetBtn = document.getElementById('resetBtn');
 const metaEl = document.getElementById('meta');
 const empty = document.getElementById('empty');
 
-let history = []; // [{question, answer}, ...]
+let history = []; // [{question, answer}, ...] -- answer holds the FULL generated text
+                   // (reasoning included), not the display-only split shown in the UI
 
 fetch('/info').then(r => r.json()).then(info => {
   metaEl.textContent =
@@ -119,6 +134,28 @@ function addBubble(role, text, opts) {
   log.appendChild(row);
   log.scrollTop = log.scrollHeight;
   return bubble;
+}
+
+// Rebuilds a bot bubble's content as (optional) collapsed "Thoughts" section + answer
+// text, Claude/ChatGPT-style. Always goes through createElement + textContent (never
+// innerHTML with interpolated text) so nothing the model generates can be parsed as
+// markup.
+function renderBotContent(bubble, answerText, reasoningText) {
+  bubble.replaceChildren();
+  if (reasoningText) {
+    const details = document.createElement('details');
+    details.className = 'thoughts';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Thoughts';
+    const content = document.createElement('div');
+    content.className = 'thoughts-content';
+    content.textContent = reasoningText;
+    details.append(summary, content);
+    bubble.appendChild(details);
+  }
+  const answerEl = document.createElement('div');
+  answerEl.textContent = answerText;
+  bubble.appendChild(answerEl);
 }
 
 async function send() {
@@ -150,9 +187,12 @@ async function send() {
       return;
     }
     const data = await resp.json();
-    pending.textContent = data.answer;
+    renderBotContent(pending, data.answer, data.reasoning);
     pending.classList.remove('pending');
-    history.push({ question: text, answer: data.answer });
+    // Persist the full text (reasoning included), not the display-only answer -- the
+    // server rebuilds context from this on the next request, and the model was
+    // trained to condition on its own reasoning trace as part of its prior turn.
+    history.push({ question: text, answer: data.full });
   } catch (e) {
     pending.textContent = 'Request failed: ' + e;
     pending.classList.remove('pending');

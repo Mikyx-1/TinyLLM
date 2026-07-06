@@ -7,14 +7,41 @@
 
 ## 🎬 Demo
 
+![TinyLLM demo: one 50M-param checkpoint handling multi-turn small talk and 1-, 2-, and 3-hop reasoning with live calculator tool-use, ChatML-style](assets/tinyllm_demo_multitask.gif)
+
+One 50M-param checkpoint (`train_reasoning.py --dataset_format chatml`) trained jointly on
+multi-turn small talk and 1-/2-/3-hop synthetic word problems, pooled as equals rather than
+one being "replay" for the other — see `data_utils.prepare_multitask_data`. Turns are
+rendered ChatML-style (`<|im_start|>{role}...<|im_end|>`, same scheme Qwen/GPT use), and the
+loss is masked to assistant spans only. The reasoning trace is real and unedited: each
+`<CALC>` call is the model deciding *when* and *what* to compute, with the actual arithmetic
+result injected rather than guessed (`model/calculator.py`, `model/generate.py`) — in
+`webchat.py` that trace renders as a collapsible "Thoughts" section, Claude/ChatGPT-style,
+instead of inline with the answer. The 3 reasoning problems shown are held out — never seen
+during training.
+
+<details>
+<summary>Earlier 50M-param demo (reasoning-only, before joint chat+reasoning training)</summary>
+
+![TinyLLM demo: 50M-param model doing 1-, 2-, and 3-hop reasoning with live calculator tool-use](assets/tinyllm_demo_multihop.gif)
+
+A 50M-param checkpoint trained on 1-, 2-, and 3-hop synthetic word problems mixed with the
+full instruction-SFT dataset (`train_reasoning.py`), solving held-out (unseen-number) problems
+at every hop depth it saw during training, plus an instruction Q&A example. Each `<CALC>`
+call is real: the model decides *when* and *what* to compute, and the actual arithmetic
+result is injected rather than guessed — see `model/calculator.py` and `model/generate.py`.
+</details>
+
+<details>
+<summary>Earlier 23M-param demo (single-hop reasoning + instruction SFT)</summary>
+
 ![TinyLLM demo: instruction SFT and reasoning with live calculator tool-use](assets/tinyllm_demo.gif)
 
-Two real, unedited checkpoints from this repo's pipeline:
+Two real, unedited checkpoints from an earlier point in this repo's pipeline:
 - **Stage 2 (instruction SFT)** — exact-match recall against the training set.
 - **Stage 3 (reasoning SFT)** — chain-of-thought answers on held-out (unseen-number) word
-  problems, with a live `<CALC>` calculator tool-call: the model decides *when* and *what* to
-  compute, and the actual arithmetic result is injected for real rather than guessed — see
-  `model/calculator.py` and `model/generate.py`.
+  problems, single-hop only.
+</details>
 
 ---
 

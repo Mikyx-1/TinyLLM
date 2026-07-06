@@ -224,7 +224,13 @@ data/preference_dataset.json
 # Synthetic reasoning data -- reproducible via generate_synthetic_reasoning.py
 data/synthetic_reasoning_dataset.json
 data/synthetic_reasoning_3hop.json
+data/synthetic_reasoning_all_hops.json
+data/synthetic_reasoning_2hop_eval.json
 data/synthetic_reasoning_heldout.json
+# Multi-turn small-talk data -- reproducible via generate_smalltalk_multiturn.py +
+# build_smalltalk_demo_dataset.py
+data/smalltalk_multiturn.json
+data/smalltalk_demo.json
 checkpoints/
 
 # Weights & Biases local run logs

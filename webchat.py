@@ -17,9 +17,14 @@ docstring on why the model is only ever scored on assistant spans).
 No extra dependencies -- uses only Python's stdlib http.server, so nothing to pip
 install beyond what training already needs.
 
+A reasoning-capable (chatml, joint multitask) checkpoint may answer with a
+<THINK>...</THINK> trace before the final answer -- chat_demo._split_reasoning() pulls
+that out token-side, and the page renders it as a collapsed "Thoughts" section you can
+expand, Claude/ChatGPT-style, instead of showing it inline with the answer.
+
 USAGE:
-    python webchat.py --checkpoint checkpoints/multiturn_chatml_test/final.pt \\
-        --tokenizer_path data/tokenizer_multiturn_chatml.json --format chatml
+    python webchat.py --checkpoint checkpoints/multitask_chatml/final.pt \\
+        --tokenizer_path checkpoints/tokenizer.json --format chatml
     Then open http://127.0.0.1:8765 in a browser.
 """
 
@@ -89,11 +94,20 @@ def make_handler(model, tokenizer, device, format: str, checkpoint_path: str, to
                 max_new_tokens = int(body.get("max_new_tokens", 40))
 
                 prompt_prefix = render_prompt_prefix(format, history)
-                answer, _ = generate_reply(
+                result = generate_reply(
                     model, tokenizer, device, prompt_prefix, message, format,
                     max_new_tokens, temperature, top_k,
                 )
-                self._send_json(200, {"answer": answer})
+                # "full" (reasoning included) is what the browser should store back into
+                # its history for the *next* request -- render_prompt_prefix rebuilds
+                # context from history's "answer" field, and if the client instead sent
+                # back the display-only "answer" (reasoning stripped), the model would
+                # lose its own reasoning trace from the transcript it conditions on.
+                self._send_json(200, {
+                    "answer": result["answer"],
+                    "reasoning": result["reasoning"],
+                    "full": result["full"],
+                })
             except Exception as e:  # noqa: BLE001 -- surface any failure to the browser instead of a dropped connection
                 self._send_json(500, {"error": str(e)})
 

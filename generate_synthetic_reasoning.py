@@ -13,15 +13,23 @@ Produces the same {question, reasoning, answer} schema as data/reasoning_dataset
 with the same <CALC>expr</CALC>result convention -- drops in as a dataset_path for
 train_reasoning.py with zero pipeline changes.
 
-Two output files with a deliberate difficulty split:
-  data/synthetic_reasoning_dataset.json  -- 1-hop and 2-hop problems, for training
-                                             (prepare_reasoning_data holds out ~200 of
-                                             these itself, for same-difficulty eval)
-  data/synthetic_reasoning_3hop.json     -- 3-hop problems, held out of training
-                                             entirely, for eval_reasoning.py
-                                             --heldout_path: tests whether the model
-                                             can compose a harder chain than it was
-                                             ever trained on, not just recall one.
+Primary output:
+  data/synthetic_reasoning_all_hops.json   -- 1-hop, 2-hop, and 3-hop problems combined into one
+                                               pool. This is train_reasoning.py's dataset_path.
+                                               A 3-hop-only training run was tried first and
+                                               diagnosed as template-locking: it forced every
+                                               answer into exactly 3 <CALC> steps, hallucinating
+                                               a spurious extra operation on 2-hop questions
+                                               that only needed 2. Training across all depths at
+                                               once is the fix -- the model needs to see that the
+                                               number of steps varies with the problem, not just
+                                               harder problems at a fixed depth.
+
+Also written, for backwards compatibility with earlier eval commands:
+  data/synthetic_reasoning_dataset.json    -- 1-hop and 2-hop only.
+  data/synthetic_reasoning_3hop.json       -- 3-hop only.
+  data/synthetic_reasoning_2hop_eval.json  -- every 2-hop example, as a fixed eval set
+                                               independent of any run's held-out split.
 
 USAGE:
     python generate_synthetic_reasoning.py
@@ -242,19 +250,39 @@ def generate_unique(templates: list, count_per_template: int, rng: random.Random
 def main():
     rng = random.Random(1337)
 
-    train_pool = generate_unique(ONE_HOP, 600, rng) + generate_unique(TWO_HOP, 500, rng)
+    one_hop = generate_unique(ONE_HOP, 600, rng)
+    two_hop = generate_unique(TWO_HOP, 500, rng)
+    three_hop = generate_unique(THREE_HOP, 1000, rng)
+
+    # Kept for backwards compatibility with existing eval commands/checkpoints.
+    train_pool = one_hop + two_hop
     rng.shuffle(train_pool)
     with open("data/synthetic_reasoning_dataset.json", "w", encoding="utf-8") as f:
         json.dump(train_pool, f, ensure_ascii=False, indent=2)
-    print(f"1-hop + 2-hop (training pool): {len(train_pool):,} examples "
-          f"-> data/synthetic_reasoning_dataset.json")
-
-    hard_pool = generate_unique(THREE_HOP, 150, rng)
+    hard_pool = three_hop[:]
     rng.shuffle(hard_pool)
     with open("data/synthetic_reasoning_3hop.json", "w", encoding="utf-8") as f:
         json.dump(hard_pool, f, ensure_ascii=False, indent=2)
-    print(f"3-hop (compositional held-out, never trained on): {len(hard_pool):,} examples "
-          f"-> data/synthetic_reasoning_3hop.json")
+    two_hop_eval = [ex for ex in train_pool if ex["hops"] == 2]
+    with open("data/synthetic_reasoning_2hop_eval.json", "w", encoding="utf-8") as f:
+        json.dump(two_hop_eval, f, ensure_ascii=False, indent=2)
+
+    # Primary output: every hop level combined into one pool. Training on all three
+    # depths (instead of 3-hop alone) is the fix for the template-locking failure mode
+    # found by testing a 3-hop-only run on 2-hop questions -- it forced every answer
+    # into exactly 3 steps, hallucinating a spurious extra operation when a problem
+    # only needed 1 or 2. prepare_reasoning_data's held_out draws a random slice of
+    # this combined pool, which lands roughly proportionally across all three depths
+    # (~41%/25%/34% 1-/2-/3-hop by construction below) -- large enough at held_out=450
+    # for a meaningful per-hop breakdown in eval_reasoning.py.
+    all_hops = one_hop + two_hop + three_hop
+    rng.shuffle(all_hops)
+    with open("data/synthetic_reasoning_all_hops.json", "w", encoding="utf-8") as f:
+        json.dump(all_hops, f, ensure_ascii=False, indent=2)
+    print(
+        f"All hops combined: {len(all_hops):,} examples -> data/synthetic_reasoning_all_hops.json "
+        f"({len(one_hop):,} 1-hop, {len(two_hop):,} 2-hop, {len(three_hop):,} 3-hop)"
+    )
 
 
 if __name__ == "__main__":
