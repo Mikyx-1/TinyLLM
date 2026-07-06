@@ -55,7 +55,7 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from data_utils import create_dataloader, prepare_custom_data
+from data_utils import create_dataloader, prepare_custom_data, prepare_multiturn_data
 from model import ModelConfig, TinyLLM
 
 try:
@@ -72,6 +72,11 @@ except ImportError:
 class TrainConfig:
     # Data
     dataset_path: str = "data/tinyllm_dataset.json"
+    # "qa": flat {question, answer} records via prepare_custom_data, loss over the whole
+    # sequence (QA_TEMPLATE). "multiturn": {"turns": [...]} conversations via
+    # prepare_multiturn_data, loss masked to <ASSISTANT> spans only -- see
+    # data_utils.encode_conversation.
+    dataset_type: str = "qa"
     data_dir: str = "data"
     tokenizer_path: str = "data/tokenizer.json"
     vocab_size: int = 8000
@@ -322,7 +327,8 @@ def train(config: TrainConfig):
     if master:
         print("\nPreparing data...")
 
-    train_ds, val_ds, tokenizer = prepare_custom_data(
+    prepare_fn = prepare_multiturn_data if config.dataset_type == "multiturn" else prepare_custom_data
+    train_ds, val_ds, tokenizer = prepare_fn(
         json_path=config.dataset_path,
         vocab_size=config.vocab_size,
         context_length=config.context_length,

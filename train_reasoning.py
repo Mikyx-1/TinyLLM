@@ -5,14 +5,18 @@ Mirrors train.py's structure/loop (LR schedule, AdamW param groups, grad clip/ac
 DDP, checkpointing) verbatim, per this repo's convention of one script per pipeline
 stage rather than a shared library. The two real differences from train.py:
 
-1. Data comes from data_utils.prepare_reasoning_data(), which holds out whole GSM8K
+1. Data comes from data_utils.prepare_reasoning_data(), which holds out whole
    problems *before* concatenation (not a token-position val_fraction cut) -- the
    point of this stage is measuring generalization to problems never seen at all, not
    loss on a slice of the training stream. Held-out examples aren't touched during
-   training; eval_reasoning.py scores them separately with real generation.
-2. There is therefore no in-loop validation pass -- checkpointing tracks train loss,
-   same as train.py's no-val path (see train.py's `has_val` branch for that pattern;
-   here it's unconditional since there's never a token-level val split).
+   training.
+2. There is no loss-based validation pass (checkpointing tracks train loss, same as
+   train.py's no-val path). Instead, every eval_interval iterations this script runs
+   real generation on a sample of the held-out set via eval_reasoning.run_examples/
+   summarize, logging exact-match accuracy (overall and per-hop, when examples carry a
+   "hops" field) and the <CALC>-count match rate to wandb/console -- plain train loss
+   alone doesn't reveal failure modes like template-locking onto a fixed number of
+   reasoning steps.
 
 HOW TO RUN:
     python train_reasoning.py
@@ -35,7 +39,8 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from data_utils import create_dataloader, prepare_reasoning_data
+from data_utils import create_dataloader, prepare_multitask_data, prepare_reasoning_data
+from eval_reasoning import print_summary, resolve_calc_ids, run_examples, summarize
 from model import ModelConfig, TinyLLM
 
 try:
@@ -51,25 +56,63 @@ except ImportError:
 @dataclass
 class TrainConfig:
     # Data
-    dataset_path: str = "data/reasoning_dataset.json"
+    dataset_path: str = "data/synthetic_reasoning_all_hops.json"  # 1-, 2-, and 3-hop
+    # combined -- a 3-hop-only run template-locked onto always emitting exactly 3
+    # <CALC> steps and hallucinated a spurious extra operation on 2-hop questions.
+
+    # "legacy": prepare_reasoning_data -- reasoning is the primary corpus, rendered via
+    # the flat, unmasked REASONING_TEMPLATE; replay_dataset_path's chat examples are
+    # mixed in unmasked too, purely so the reasoning run doesn't forget chat.
+    # "chatml": prepare_multitask_data -- chat (multiturn_dataset_path) and reasoning
+    # are pooled and shuffled together as EQUALS, both rendered through the same
+    # <|im_start|>/<|im_end|> ChatML turns with the loss masked to assistant spans only
+    # (see data_utils.reasoning_example_to_conversation). The model can't tell the two
+    # task types apart by template, only by content -- the actual objective here is
+    # "answer both well," not "don't forget chat while learning reasoning."
+    # replay_dataset_path/replay_count below are ignored in "chatml" mode.
+    dataset_format: str = "legacy"
+    multiturn_dataset_path: str = "data/smalltalk_multiturn.json"  # only used when
+    # dataset_format="chatml"
+
     tokenizer_path: str = "checkpoints/tokenizer.json"
-    vocab_size: int = 12_002  # must match the resumed checkpoint's (resized for <CALC>)
+    vocab_size: int = 12_002  # same tokenizer as every other stage (resized for <CALC>)
     context_length: int = 384
-    held_out: int = 200  # whole GSM8K problems excluded from training, for eval_reasoning.py
+    held_out: int = 450  # random slice of the combined pool; lands roughly proportionally
+    # across all three depths (~41%/25%/34% by construction), large enough for a
+    # meaningful per-hop breakdown in eval_reasoning.py
     heldout_out_path: str = "data/reasoning_heldout.json"
     seed: int = 42
+
+    # Mix the *entire* Q&A dataset in among the reasoning examples -- not a sample. See
+    # data_utils.prepare_reasoning_data's docstring -- a reasoning-only fine-tune from an
+    # SFT checkpoint catastrophically overwrote that checkpoint's Q&A ability (confirmed
+    # directly), and a later run that replayed only a 2000/20061 sample of the generic
+    # Alpaca/Dolly-heavy SFT set still left ~90% of it totally unseen (confirmed too).
+    # replay_dataset_path now points at the curated small-talk set (single-turn +
+    # combinatorial 2-turn, data/smalltalk_demo.json) instead of the generic SFT set --
+    # replacing Alpaca/Dolly content with small talk was an explicit, separate decision,
+    # not something to fold in silently alongside the reasoning-data changes below.
+    # replay_count is set above the actual dataset size; prepare_reasoning_data clamps to
+    # len(replay_pool), so this always means "every example," resilient to the file's
+    # size changing later.
+    replay_dataset_path: str = "data/smalltalk_demo.json"
+    replay_count: int = 1_000_000
 
     # Model architecture (d_model/n_heads/n_layers/d_ff/use_learned_pos_emb only take
     # effect if NOT resuming from a checkpoint; dropout always applies -- see resume_from
     # below, it has no learned parameters so it's always safe to override on resume).
-    d_model: int = 512
-    n_heads: int = 8
+    # ~50.4M params at vocab_size=12002, context_length=384 (vs. 23.15M in every earlier
+    # stage) -- no pretraining step for this run, so there's no existing checkpoint this
+    # size to inherit; it trains from random init directly on the mixed corpus below.
+    d_model: int = 768
+    n_heads: int = 12
     n_layers: int = 8
-    d_ff: int = 1024
-    dropout: float = 0.2  # raised from Stage 2's 0.1 (which wasn't even applying on
-    # resume until the fix above) -- first reasoning-SFT run hit train loss 0.099 by
-    # iter 2410/10000 while held-out accuracy stayed at chance: memorizing training
-    # reasoning chains rather than learning transferable arithmetic reasoning.
+    d_ff: int = 1792
+    dropout: float = 0.0  # explicitly back to 0 -- this run's goal is deliberate
+    # memorization of the combined small-talk + reasoning corpus (like Stage 2's
+    # original SFT run), not generalization to unseen problems, so there's no reason
+    # to fight overfitting here. A previous run raised this to 0.2 specifically to
+    # slow memorization down for a held-out-accuracy measurement; that's not this run.
     use_learned_pos_emb: bool = True
 
     # Training
@@ -81,9 +124,8 @@ class TrainConfig:
     warmup_iters: int = 200
     min_lr: float = 1e-5
     max_lr: float = 3e-4
-    weight_decay: float = 0.3  # raised from 0.1 for the same overfitting reason as
-    # dropout above -- this stage measures generalization to held-out problems, unlike
-    # the deliberate weight_decay=0 memorization run in Stage 2.
+    weight_decay: float = 0.0  # explicitly back to 0, same reasoning as dropout above --
+    # deliberate memorization this run, not a generalization measurement.
     grad_clip: float = 1.0
     beta1: float = 0.9
     beta2: float = 0.95
@@ -91,12 +133,23 @@ class TrainConfig:
     # Logging
     log_interval: int = 10
 
+    # Generation-based eval (real held-out generation via eval_reasoning.run_examples,
+    # not the training loss): plain train loss is a token-average and, as found while
+    # using this exact pipeline, hides a lot -- e.g. a model can reach near-zero loss
+    # while template-locking onto always emitting exactly 3 <CALC> steps regardless of
+    # what a given problem needs. eval_interval is separate from (and much coarser
+    # than) checkpoint_interval because generation is far more expensive than a forward
+    # pass; eval_sample_size caps the held-out slice actually generated on per eval so
+    # this doesn't dominate wall-clock time.
+    eval_interval: int = 1000
+    eval_sample_size: int = 80
+
     # Checkpointing
-    checkpoint_dir: str = "checkpoints/reasoning"
+    checkpoint_dir: str = "checkpoints/reasoning_smalltalk_50M"
     checkpoint_interval: int = 500
-    resume_from: str = "checkpoints/sft_memorize_100k/final_calc_ready.pt"
-    resume_weights_only: bool = True  # cross-stage init: fresh optimizer/iter count,
-    # not a resumed-mid-run of this same stage
+    resume_from: str = ""  # no pretraining for this run -- trains from random init
+    resume_weights_only: bool = True  # irrelevant while resume_from is empty; kept for
+    # parity with train.py/other stages in case this is pointed at a checkpoint later
 
     # System
     dtype: str = "bfloat16"  # float32, float16, bfloat16
@@ -243,17 +296,31 @@ def train(config: TrainConfig):
 
     # --- Data ---
     if master:
-        print("\nPreparing reasoning data...")
+        print(f"\nPreparing data (dataset_format={config.dataset_format})...")
 
-    train_ds, held_out_examples, tokenizer = prepare_reasoning_data(
-        json_path=config.dataset_path,
-        vocab_size=config.vocab_size,
-        context_length=config.context_length,
-        held_out=config.held_out,
-        seed=config.seed,
-        tokenizer_path=config.tokenizer_path,
-        heldout_out_path=config.heldout_out_path,
-    )
+    if config.dataset_format == "chatml":
+        train_ds, held_out_examples, tokenizer = prepare_multitask_data(
+            multiturn_path=config.multiturn_dataset_path,
+            reasoning_path=config.dataset_path,
+            vocab_size=config.vocab_size,
+            context_length=config.context_length,
+            held_out=config.held_out,
+            seed=config.seed,
+            tokenizer_path=config.tokenizer_path,
+            heldout_out_path=config.heldout_out_path,
+        )
+    else:
+        train_ds, held_out_examples, tokenizer = prepare_reasoning_data(
+            json_path=config.dataset_path,
+            vocab_size=config.vocab_size,
+            context_length=config.context_length,
+            held_out=config.held_out,
+            seed=config.seed,
+            tokenizer_path=config.tokenizer_path,
+            heldout_out_path=config.heldout_out_path,
+            replay_dataset_path=config.replay_dataset_path,
+            replay_count=config.replay_count,
+        )
 
     train_loader = create_dataloader(
         train_ds,
@@ -428,9 +495,30 @@ def train(config: TrainConfig):
             running_loss = 0.0
             t0 = time.time()
 
+        # --- Periodic generation-based eval (see module docstring) ---
+        if master and (iter_num + 1) % config.eval_interval == 0:
+            eval_model = model.module if isinstance(model, DDP) else model
+            eval_model = eval_model._orig_mod if hasattr(eval_model, "_orig_mod") else eval_model
+            eval_sample = held_out_examples[: config.eval_sample_size]
+            eval_calc_ids = resolve_calc_ids(tokenizer, use_calc=True)
+            eval_format = "chatml" if config.dataset_format == "chatml" else "qa"
+            results = run_examples(
+                eval_model, tokenizer, eval_sample, device, eval_calc_ids, format=eval_format
+            )
+            summary = summarize(results)
+            print(f"{'>>> EVAL':>8} | {'':>10} | {'':>12} | {'':>10} |")
+            print_summary(summary)
+            if config.use_wandb:
+                log_dict = {"eval/accuracy": summary["accuracy"]}
+                if "hop_count_match_rate" in summary:
+                    log_dict["eval/hop_count_match_rate"] = summary["hop_count_match_rate"]
+                for h, (acc, _) in summary.get("per_hop", {}).items():
+                    log_dict[f"eval/accuracy_{h}hop"] = acc
+                wandb.log(log_dict, step=iter_num + 1)
+
         # --- Periodic checkpointing ---
-        # No in-loop validation (see module docstring) -- held-out GSM8K problems are
-        # scored separately by eval_reasoning.py with real generation, not loss.
+        # No in-loop validation (see module docstring) -- held-out problems are scored
+        # separately (above) with real generation, not loss.
         if master and (iter_num + 1) % config.checkpoint_interval == 0:
             if config.use_wandb:
                 wandb.log({"train/checkpoint_loss": accum_loss}, step=iter_num + 1)
@@ -469,7 +557,12 @@ def parse_args():
     cfg = TrainConfig()
     for key, val in cfg.__dict__.items():
         if isinstance(val, bool):
-            parser.add_argument(f"--{key}", default=val, action="store_true")
+            # BooleanOptionalAction (not plain store_true) so defaults of True are
+            # actually overridable from the CLI via --no-<key> -- store_true can only
+            # ever set a flag to True, so e.g. resume_weights_only (default True) could
+            # never be turned off to continue training with preserved iter/optimizer
+            # state.
+            parser.add_argument(f"--{key}", default=val, action=argparse.BooleanOptionalAction)
         else:
             parser.add_argument(f"--{key}", type=type(val), default=val)
     return parser.parse_args()
