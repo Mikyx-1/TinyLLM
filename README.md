@@ -1,21 +1,44 @@
 # 🧠 TinyLLM — Build an LLM From Scratch
 
-> A minimal, heavily-commented GPT-style language model (~20M parameters) for learning purposes.
+> A minimal, heavily-commented GPT-style language model for learning purposes.
 > Every component is implemented from scratch — no HuggingFace, no pre-built transformers.
 
-**Who this is for:** anyone who wants to understand *how* an LLM like GPT actually works —
-tokenizer, transformer, training loop, and text generation — by reading code you can run and
-change, not by reading about someone else's black box. No prior deep learning experience
-is assumed; the [What You'll Learn](#-what-youll-learn) section below explains each concept
-from first principles.
+## 💡 Why TinyLLM?
+
+Most from-scratch LLM repos optimize for one thing: getting the training loss down.
+[Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT) is the gold standard for that —
+but reproducing a GPT-2-quality run out of it means renting cloud A100s, which realistically
+costs on the order of **$100+** and hours of babysitting a training job you can't iterate on
+casually.
+
+TinyLLM optimizes for the other thing: **understanding**. Every stage a real LLM pipeline
+goes through — tokenizer training, pretraining on raw text, instruction fine-tuning,
+reasoning fine-tuning with tool-use, and a chat interface to actually talk to the result —
+is here, small enough to run end-to-end **on a single consumer GPU you already own**, in
+minutes to hours instead of days. You're not spectating a loss curve on someone else's
+infrastructure; you're stepping through the same pipeline GPT/LLaMA use, just at a scale
+where you can read every line, change it, and watch what breaks.
+
+### 🖥️ Minimum Requirements
+
+| Resource | Minimum | Notes |
+|----------|---------|-------|
+| **GPU** | None required | Falls back to CPU automatically (`train.py`/`pretrain.py`) — slower, but every script runs |
+| **GPU (recommended)** | RTX 3060 (12 GB) or similar Ampere+ card | Ampere+ is needed to actually benefit from `bfloat16` mixed precision (see [Mixed Precision](#-mixed-precision-bfloat16)); the default "Tiny" config trains comfortably within a few GB of VRAM |
+| **RAM** | 16 GB | Covers dataset downloads (Alpaca/Dolly/GSM8K/WikiText-2 are all small, low hundreds of MB combined) and tokenizer training |
+| **Disk** | ~2 GB free | Raw datasets + checkpoints + optional W&B logs |
+| **Python** | 3.10+ | With PyTorch (CUDA build optional, see [Quick Start](#-quick-start)) |
+
+No multi-GPU setup is required — DDP support exists for when you *have* more than one GPU,
+not as a prerequisite for anything in this repo to work.
 
 ## 📑 Table of Contents
 
 - [Demo](#-demo)
+- [Chat UI](#️-chat-ui)
 - [What You'll Learn](#-what-youll-learn)
-- [Custom Q&A Dataset](#-custom-qa-dataset)
+- [Datasets & Data Pipeline](#-datasets--data-pipeline)
 - [Quick Start](#-quick-start)
-- [Model Size Reference](#-model-size-reference)
 - [Limitations & Caveats](#-limitations--caveats)
 - [Experiment Ideas](#-experiment-ideas)
 - [Key Papers](#-key-papers)
@@ -24,18 +47,53 @@ from first principles.
 
 ## 🎬 Demo
 
-![TinyLLM demo: one 50M-param checkpoint handling multi-turn small talk and 1-, 2-, and 3-hop reasoning with live calculator tool-use, ChatML-style](assets/tinyllm_demo_multitask.gif)
+![TinyLLM demo: a live browser chat session with a 50M-param checkpoint handling small talk and a held-out word problem with live calculator tool-use, ChatML-style](assets/tinyllm_webchat_demo.gif)
 
-One 50M-param checkpoint (`train_reasoning.py --dataset_format chatml`) trained jointly on
-multi-turn small talk and 1-/2-/3-hop synthetic word problems, pooled as equals rather than
-one being "replay" for the other — see `data_utils.prepare_multitask_data`. Turns are
-rendered ChatML-style (`<|im_start|>{role}...<|im_end|>`, same scheme Qwen/GPT use), and the
-loss is masked to assistant spans only. The reasoning trace is real and unedited: each
-`<CALC>` call is the model deciding *when* and *what* to compute, with the actual arithmetic
-result injected rather than guessed (`model/calculator.py`, `model/generate.py`) — in
-`webchat.py` that trace renders as a collapsible "Thoughts" section, Claude/ChatGPT-style,
-instead of inline with the answer. The 3 reasoning problems shown are held out — never seen
-during training.
+This is a real, unedited session in `webchat.py` against a 50M-param checkpoint
+(`train_reasoning.py --dataset_format chatml`) trained jointly on multi-turn small talk and
+1-/2-/3-hop synthetic word problems, pooled as equals rather than one being "replay" for the
+other — see `data_utils.prepare_multitask_data`. Turns are rendered ChatML-style
+(`<|im_start|>{role}...<|im_end|>`, same scheme Qwen/GPT use), and the loss is masked to
+assistant spans only.
+
+"Good morning" and "Can you tell me a joke?" are answered exactly as trained — this is the
+point of the demo, not a limitation: the goal of this stage isn't teaching the model to
+generalize, it's taking it from outputting nonsense to reliably answering things close to
+what it was trained on. The word problem is different: it's pulled from
+`data/reasoning_heldout.json`, held out and never trained on. The reasoning trace is real —
+each `<CALC>` call is the model deciding *when* and *what* to compute, with the actual
+arithmetic result injected rather than guessed (`model/calculator.py`, `model/generate.py`)
+— and renders as a collapsible "Thoughts" section, Claude/ChatGPT-style, instead of inline
+with the answer.
+
+---
+
+## 🖥️ Chat UI
+
+![TinyLLM webchat UI: a small-talk exchange followed by a held-out word problem, with the Thoughts trace expanded](assets/tinyllm_webchat_screenshot.png)
+
+Once you have a checkpoint, there are two ways to talk to it:
+
+- **`chat_demo.py`** — CLI demo that feeds a fixed sequence of questions to prove the
+  pipeline works end-to-end.
+- **`webchat.py`** — a real chat UI in your browser, for typing arbitrary follow-ups
+  yourself and watching the *live* answer come back:
+
+```bash
+python webchat.py \
+    --checkpoint checkpoints/multitask_chatml/final.pt \
+    --tokenizer_path checkpoints/tokenizer.json \
+    --format chatml
+# opens http://127.0.0.1:8765
+```
+
+It's a tiny stdlib-only HTTP server (no extra `pip install` beyond training) serving a
+static chat page. It's **stateless by design**: the browser resends the full conversation
+history with every request and the server rebuilds the prompt from scratch each time —
+the same mechanic real chat APIs use, and it means what you see is exactly what the model
+does with the conversation so far, not some server-side memory trick. On a reasoning-capable
+checkpoint, any `<THINK>...</THINK>` trace is pulled out and rendered as a collapsible
+"Thoughts" section, Claude/ChatGPT-style, instead of inline with the answer.
 
 ---
 
@@ -170,11 +228,57 @@ GPU 1: model copy → forward(batch_shard_1) → backward → gradients ─┤
 
 ---
 
-## 📦 Custom Q&A Dataset
+## 📦 Datasets & Data Pipeline
 
-You can train TinyLLM on your own question-answer data using a simple JSON format.
+At this scale, throwing generic text at the model isn't enough — both *what* the shared
+tokenizer sees and *what skill* each stage is asked to learn have to be deliberately
+scoped down to something learnable at 10M–65M parameters. TinyLLM mixes real corpora
+with purpose-built synthetic data for exactly that reason.
 
-### Format
+### Stage 0 — one-time setup (`prepare_pipeline_data.py`)
+
+```bash
+python prepare_pipeline_data.py --force_retrain_tokenizer   # first run, or to fold in a new corpus
+```
+
+Downloads real datasets, builds one shared BPE tokenizer used by every later stage, and
+writes the per-stage files everything else reads from:
+
+| Source | Used for | Output |
+|--------|----------|--------|
+| WikiText-2 (real Wikipedia prose) | Stage 1 pretraining — Alpaca/GSM8K text alone has essentially no world-knowledge exposure | `data/raw_text/corpus.txt` |
+| Alpaca + Dolly-15k | Stage 2 instruction SFT | `data/sft_dataset.json` |
+| GSM8K (train/test) | Stage 3 reasoning SFT (real chain-of-thought math) | `data/reasoning_dataset.json` |
+
+Re-running is safe and cheap — downloads are skipped if already present, and the tokenizer
+is reused (not retrained) by default so changing the SFT mix later doesn't invalidate an
+existing pretrained checkpoint's vocabulary.
+
+### Synthetic data generators
+
+Real datasets like GSM8K are open-domain and hard for a 10M-param model to make progress
+on quickly. TinyLLM also ships generators for narrower, controlled tasks it *can* actually
+learn:
+
+- **`generate_synthetic_reasoning.py`** → `data/synthetic_reasoning_all_hops.json` — templated
+  1-, 2-, and 3-hop arithmetic word problems. The `<CALC>` tool already guarantees correct
+  arithmetic (see [Limitations](#-limitations--caveats)), so this isolates the actual hard
+  part: correctly reading which numbers and operation a problem calls for.
+- **`generate_smalltalk_multiturn.py`** + **`build_smalltalk_demo_dataset.py`** →
+  `data/smalltalk_multiturn.json` / `data/smalltalk_demo.json` — multi-turn small-talk
+  conversations built by cross-combining independent "opener" and "follow-up" pools, so
+  every opener is followed by many different follow-ups. This forces the model to actually
+  read turn 2 instead of memorizing one fixed script per opener.
+
+Both feed `train_reasoning.py --dataset_format chatml`, which pools chat and reasoning
+conversations as equals through `data_utils.prepare_multitask_data` — see the
+[Demo](#-demo) section above for what that checkpoint can do.
+
+### Bring your own data
+
+You can also train TinyLLM on your own question-answer data using a simple JSON format.
+
+#### Format
 
 ```json
 [
@@ -200,7 +304,7 @@ You can train TinyLLM on your own question-answer data using a simple JSON forma
 | `question` | ✅ Yes | The input question text |
 | `answer` | ✅ Yes | The expected answer text |
 
-### How It Works
+#### How It Works
 
 Each Q&A pair is automatically wrapped with boundary tokens before training:
 
@@ -211,7 +315,7 @@ Answer: I am TinyLLM, a small but capable language model here to help you! <EOS>
 
 This teaches the model **where answers end** — without `<EOS>` boundaries, the model would answer a question and then immediately ask itself another one and keep going indefinitely.
 
-### Training on Custom Data
+#### Training on Custom Data
 
 ```python
 from data_utils import prepare_custom_data, create_dataloader
@@ -226,7 +330,7 @@ train_ds, val_ds, tokenizer = prepare_custom_data(
 loader = create_dataloader(train_ds, batch_size=8)
 ```
 
-### Stopping at `<EOS>` During Inference
+#### Stopping at `<EOS>` During Inference
 
 Your generation loop must honour the `<EOS>` token:
 
@@ -289,24 +393,16 @@ python generate.py \
 
 ---
 
-## 📐 Model Size Reference
-
-| Config              | d_model | n_layers | n_heads | vocab_size | context_length | d_ff | Params |
-|---------------------|---------|----------|---------|------------|----------------|------|--------|
-| 🐭 Tiny (default)   | 384     | 6        | 6       | 10000          | 256              | 512    | ~10M  |
-| 🐱 Small            | 512     | 8        | 8       | 10000          | 256              | 1024    | ~22M   |
-| 🐻 Medium           | 768     | 12       | 12      | 10000          | 256              | 1536    | ~65M  |
-
----
-
 ## ⚠️ Limitations & Caveats
 
 TinyLLM is a *learning tool*, not a production model — knowing where it falls short is
 part of understanding how it works:
 
-- **No world knowledge.** At 10M–65M parameters trained on a small corpus, it has nowhere
-  near enough capacity or data to have memorized facts the way GPT-3/4 does. It will
-  confidently make things up (hallucinate) outside what it was trained on.
+- **No world knowledge.** The default config is ~10M parameters (bump `d_model`/`n_layers`
+  via CLI flags and it scales to tens of millions — see `model/config.py`), trained on a
+  small corpus. That's nowhere near enough capacity or data to have memorized facts the
+  way GPT-3/4 does. It will confidently make things up (hallucinate) outside what it was
+  trained on.
 - **Short context window.** `context_length` is 256 tokens by default — a few paragraphs.
   Long documents or long conversations will simply fall off the front of the window.
   Compare to production LLMs, which use 32K–1M+ token windows.
@@ -319,9 +415,6 @@ part of understanding how it works:
 - **Reasoning is on synthetic, templated word problems**, not open-domain math (like
   GSM8K) or general reasoning. This narrows the skill on purpose so it's learnable at
   this scale — it does not mean the model can reason broadly.
-- **No RLHF / safety alignment.** Training is supervised fine-tuning (SFT) only —
-  there's no preference-tuning or safety filtering step, so outputs aren't guarded
-  against harmful, biased, or unsafe content the way deployed assistants are.
 - **Demo examples are held-out but few.** The `<CALC>` reasoning examples shown in the
   demo are unseen during training, but the held-out set is small — treat the demo as a
   qualitative illustration, not a statistically rigorous benchmark result.
