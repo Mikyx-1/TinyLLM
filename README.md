@@ -3,6 +3,23 @@
 > A minimal, heavily-commented GPT-style language model (~20M parameters) for learning purposes.
 > Every component is implemented from scratch — no HuggingFace, no pre-built transformers.
 
+**Who this is for:** anyone who wants to understand *how* an LLM like GPT actually works —
+tokenizer, transformer, training loop, and text generation — by reading code you can run and
+change, not by reading about someone else's black box. No prior deep learning experience
+is assumed; the [What You'll Learn](#-what-youll-learn) section below explains each concept
+from first principles.
+
+## 📑 Table of Contents
+
+- [Demo](#-demo)
+- [What You'll Learn](#-what-youll-learn)
+- [Custom Q&A Dataset](#-custom-qa-dataset)
+- [Quick Start](#-quick-start)
+- [Model Size Reference](#-model-size-reference)
+- [Limitations & Caveats](#-limitations--caveats)
+- [Experiment Ideas](#-experiment-ideas)
+- [Key Papers](#-key-papers)
+
 ---
 
 ## 🎬 Demo
@@ -19,29 +36,6 @@ result injected rather than guessed (`model/calculator.py`, `model/generate.py`)
 `webchat.py` that trace renders as a collapsible "Thoughts" section, Claude/ChatGPT-style,
 instead of inline with the answer. The 3 reasoning problems shown are held out — never seen
 during training.
-
-<details>
-<summary>Earlier 50M-param demo (reasoning-only, before joint chat+reasoning training)</summary>
-
-![TinyLLM demo: 50M-param model doing 1-, 2-, and 3-hop reasoning with live calculator tool-use](assets/tinyllm_demo_multihop.gif)
-
-A 50M-param checkpoint trained on 1-, 2-, and 3-hop synthetic word problems mixed with the
-full instruction-SFT dataset (`train_reasoning.py`), solving held-out (unseen-number) problems
-at every hop depth it saw during training, plus an instruction Q&A example. Each `<CALC>`
-call is real: the model decides *when* and *what* to compute, and the actual arithmetic
-result is injected rather than guessed — see `model/calculator.py` and `model/generate.py`.
-</details>
-
-<details>
-<summary>Earlier 23M-param demo (single-hop reasoning + instruction SFT)</summary>
-
-![TinyLLM demo: instruction SFT and reasoning with live calculator tool-use](assets/tinyllm_demo.gif)
-
-Two real, unedited checkpoints from an earlier point in this repo's pipeline:
-- **Stage 2 (instruction SFT)** — exact-match recall against the training set.
-- **Stage 3 (reasoning SFT)** — chain-of-thought answers on held-out (unseen-number) word
-  problems, single-hop only.
-</details>
 
 ---
 
@@ -302,6 +296,35 @@ python generate.py \
 | 🐭 Tiny (default)   | 384     | 6        | 6       | 10000          | 256              | 512    | ~10M  |
 | 🐱 Small            | 512     | 8        | 8       | 10000          | 256              | 1024    | ~22M   |
 | 🐻 Medium           | 768     | 12       | 12      | 10000          | 256              | 1536    | ~65M  |
+
+---
+
+## ⚠️ Limitations & Caveats
+
+TinyLLM is a *learning tool*, not a production model — knowing where it falls short is
+part of understanding how it works:
+
+- **No world knowledge.** At 10M–65M parameters trained on a small corpus, it has nowhere
+  near enough capacity or data to have memorized facts the way GPT-3/4 does. It will
+  confidently make things up (hallucinate) outside what it was trained on.
+- **Short context window.** `context_length` is 256 tokens by default — a few paragraphs.
+  Long documents or long conversations will simply fall off the front of the window.
+  Compare to production LLMs, which use 32K–1M+ token windows.
+- **Small vocabulary.** `vocab_size=10000` (vs. ~100K+ for GPT-4-class tokenizers) means
+  more tokens per word on average, especially for rare words or non-English text.
+- **The `<CALC>` tool only does arithmetic.** `model/calculator.py` supports `+ - * /`
+  and parentheses — no algebra, no unit conversion, no comparisons. It's real (not
+  guessed) arithmetic, but the model still has to correctly decide *which* numbers and
+  operation to plug in, which is the actual hard part (see `generate_synthetic_reasoning.py`).
+- **Reasoning is on synthetic, templated word problems**, not open-domain math (like
+  GSM8K) or general reasoning. This narrows the skill on purpose so it's learnable at
+  this scale — it does not mean the model can reason broadly.
+- **No RLHF / safety alignment.** Training is supervised fine-tuning (SFT) only —
+  there's no preference-tuning or safety filtering step, so outputs aren't guarded
+  against harmful, biased, or unsafe content the way deployed assistants are.
+- **Demo examples are held-out but few.** The `<CALC>` reasoning examples shown in the
+  demo are unseen during training, but the held-out set is small — treat the demo as a
+  qualitative illustration, not a statistically rigorous benchmark result.
 
 ---
 
