@@ -74,7 +74,7 @@ Once you have a checkpoint, there are two ways to talk to it:
   actually generates:
 
 ```bash
-python webchat.py \
+python -m demo.webchat \
     --checkpoint checkpoints/multitask_chatml/final.pt \
     --tokenizer_path checkpoints/tokenizer.json \
     --format chatml
@@ -239,7 +239,7 @@ with purpose-built synthetic data for exactly that reason.
 ### Stage 0 — one-time setup (`prepare_pipeline_data.py`)
 
 ```bash
-python prepare_pipeline_data.py --force_retrain_tokenizer   # first run, or to fold in a new corpus
+python -m data_pipeline.prepare_pipeline_data --force_retrain_tokenizer   # first run, or to fold in a new corpus
 ```
 
 Downloads real datasets, builds one shared BPE tokenizer used by every later stage, and
@@ -355,22 +355,26 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 ### Train (single GPU)
 ```bash
-python train.py
+python -m training.train
 ```
 
 ### Train (multi-GPU)
 ```bash
-torchrun --nproc_per_node=2 train.py
+torchrun --nproc_per_node=2 -m training.train
 ```
 
 ### Train with custom settings
 ```bash
-torchrun --nproc_per_node=2 train.py \
+torchrun --nproc_per_node=2 -m training.train \
     --batch_size 32 \
     --max_iters 5000 \
     --d_model 512 \
+    --n_heads 8 \
     --n_layers 8
 ```
+`d_model` must be divisible by `n_heads` (`model/config.py` validates this) — the
+default `n_heads` is 6, which doesn't divide 512, so raising `d_model` means picking
+a compatible `n_heads` too.
 
 ### Monitor training with Weights & Biases
 Both `train.py` (SFT) and `pretrain.py` support optional [W&B](https://wandb.ai) logging of train/val
@@ -378,13 +382,13 @@ loss, perplexity, learning rate, tokens/sec, and gradients — off by default, o
 ```bash
 pip install wandb
 wandb login
-python train.py --use_wandb --wandb_project tinyllm-sft --wandb_run_name my-run
-python pretrain.py --use_wandb --wandb_project tinyllm-pretrain
+python -m training.train --use_wandb --wandb_project tinyllm-sft --wandb_run_name my-run
+python -m training.pretrain --use_wandb --wandb_project tinyllm-pretrain
 ```
 
 ### Generate text
 ```bash
-python generate.py \
+python -m demo.inference \
     --checkpoint checkpoints/latest.pt \
     --prompt "Who are you?" \
     --temperature 0.8 \

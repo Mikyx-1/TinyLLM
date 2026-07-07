@@ -20,9 +20,9 @@ using this repo's pipeline:
 
 Run this against before/after checkpoints for a comparison:
 
-    python eval_reasoning.py --checkpoint checkpoints/sft_memorize_100k/final_calc_ready.pt \\
+    python -m training.eval_reasoning --checkpoint checkpoints/sft_memorize_100k/final_calc_ready.pt \\
         --label "before (plain SFT)"
-    python eval_reasoning.py --checkpoint checkpoints/reasoning/final.pt \\
+    python -m training.eval_reasoning --checkpoint checkpoints/reasoning/final.pt \\
         --label "after (reasoning SFT)"
 
 Expect low absolute accuracy at this model scale -- the comparison between runs, and

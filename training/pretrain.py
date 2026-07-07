@@ -3,21 +3,21 @@ Pre-Training Stage for TinyLLM
 
 HOW TO RUN:
     # 1. Train tokenizer and tokenize corpus (once):
-    python pretokenize.py --train_tokenizer --corpus_dir data/raw_text
-    python pretokenize.py --corpus_dir data/raw_text --out_dir data/tokenized
+    python -m data_pipeline.pretokenize --train_tokenizer --corpus_dir data/raw_text
+    python -m data_pipeline.pretokenize --corpus_dir data/raw_text --out_dir data/tokenized
 
     # 2. Pre-train:
-    python pretrain.py --corpus_dir data/tokenized
+    python -m training.pretrain --corpus_dir data/tokenized
 
     # 3. Multi-GPU:
-    torchrun --nproc_per_node=2 pretrain.py --corpus_dir data/tokenized
+    torchrun --nproc_per_node=2 -m training.pretrain --corpus_dir data/tokenized
 
     # 4. Resume:
-    python pretrain.py --corpus_dir data/tokenized --resume_from checkpoints/pretrain/latest.pt
+    python -m training.pretrain --corpus_dir data/tokenized --resume_from checkpoints/pretrain/latest.pt
 
     # 5. With Weights & Biases logging:
     pip install wandb && wandb login
-    python pretrain.py --corpus_dir data/tokenized --use_wandb --wandb_project my-project
+    python -m training.pretrain --corpus_dir data/tokenized --use_wandb --wandb_project my-project
 """
 
 import argparse

@@ -16,7 +16,7 @@ dedicated subword coverage and (unlike the Dolly case) there's no existing check
 you're intentionally retraining the tokenizer.
 
 USAGE:
-    python prepare_pipeline_data.py --force_retrain_tokenizer   # first run, or to fold in a new corpus
+    python -m data_pipeline.prepare_pipeline_data --force_retrain_tokenizer   # first run, or to fold in a new corpus
 
 Outputs:
     data/raw/{alpaca_data.json, dolly_15k.jsonl, gsm8k_train.jsonl, gsm8k_test.jsonl, wikitext2_train.txt}
@@ -329,7 +329,7 @@ def main(cfg: PipelineDataConfig) -> None:
     print(f"  SFT dataset        : {len(sft_pairs):,} examples")
     print(f"  Reasoning dataset  : {len(reasoning_examples):,} examples")
     print(f"  Tokenizer vocab    : {tokenizer.vocab_size}")
-    print("\nNext: python pretokenize.py --corpus_dir data/raw_text --tokenizer_path checkpoints/tokenizer.json --out_dir data/tokenized")
+    print("\nNext: python -m data_pipeline.pretokenize --corpus_dir data/raw_text --tokenizer_path checkpoints/tokenizer.json --out_dir data/tokenized")
 
 
 if __name__ == "__main__":

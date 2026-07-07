@@ -29,17 +29,17 @@ This is the main training script. It implements:
 
 HOW TO RUN:
     Single GPU:
-        python train.py
+        python -m training.train
 
     Multi-GPU (2 GPUs):
-        torchrun --nproc_per_node=2 train.py
+        torchrun --nproc_per_node=2 -m training.train
 
     With custom config:
-        torchrun --nproc_per_node=2 train.py --batch_size 16 --max_iters 5000
+        torchrun --nproc_per_node=2 -m training.train --batch_size 16 --max_iters 5000
 
     With Weights & Biases logging:
         pip install wandb && wandb login
-        python train.py --use_wandb --wandb_project my-project
+        python -m training.train --use_wandb --wandb_project my-project
 """
 
 import argparse
@@ -171,7 +171,7 @@ def setup_ddp():
     - LOCAL_RANK: rank on this node (maps to GPU index)
     - WORLD_SIZE: total number of processes (= total GPUs)
 
-    When running single-GPU (python train.py):
+    When running single-GPU (python -m training.train):
     - These env vars aren't set, so we use rank=0, world_size=1
     """
     if "RANK" in os.environ:
