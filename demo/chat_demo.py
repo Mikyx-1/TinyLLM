@@ -19,9 +19,9 @@ Two prompt formats, matching whichever pipeline the checkpoint was trained with:
                     truncation hack is needed -- generation should just stop cleanly.
 
 USAGE:
-    python chat_demo.py --checkpoint checkpoints/smalltalk_demo_v2/final.pt \\
+    python -m demo.chat_demo --checkpoint checkpoints/smalltalk_demo_v2/final.pt \\
         --turns "Hello" "Can you tell me a joke?"
-    python chat_demo.py --checkpoint checkpoints/multitask_chatml/final.pt \\
+    python -m demo.chat_demo --checkpoint checkpoints/multitask_chatml/final.pt \\
         --tokenizer_path checkpoints/tokenizer.json --format chatml \\
         --turns "Hello" "A store has 8 boxes of pens, 6 pens per box. It sells 15. How many pens are left?"
 """

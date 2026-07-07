@@ -33,7 +33,7 @@ that out token-side, and the page renders it as a collapsed "Thoughts" section y
 expand, Claude/ChatGPT-style, instead of showing it inline with the answer.
 
 USAGE:
-    python webchat.py --checkpoint checkpoints/multitask_chatml/final.pt \\
+    python -m demo.webchat --checkpoint checkpoints/multitask_chatml/final.pt \\
         --tokenizer_path checkpoints/tokenizer.json --format chatml
     Then open http://127.0.0.1:8765 in a browser.
 
@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
 
-from chat_demo import generate_reply, load_model, render_prompt_prefix
+from demo.chat_demo import generate_reply, load_model, render_prompt_prefix
 from tokenizer import BPETokenizer
 
 STATIC_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webchat_ui.html")

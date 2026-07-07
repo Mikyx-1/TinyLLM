@@ -2,12 +2,13 @@
 inference.py — load a checkpoint and generate text from a prompt.
 
 Usage:
-    python inference.py --checkpoint checkpoints/latest.pt --prompt "To be or not to be"
-    python inference.py --checkpoint checkpoints/latest.pt --prompt "Friends, Romans" --temperature 0.8 --top_k 40
-    python inference.py --checkpoint checkpoints/latest.pt --prompt "What" --temperature 0 --max_tokens 200
+    python -m demo.inference --checkpoint checkpoints/latest.pt --prompt "To be or not to be"
+    python -m demo.inference --checkpoint checkpoints/latest.pt --prompt "Friends, Romans" --temperature 0.8 --top_k 40
+    python -m demo.inference --checkpoint checkpoints/latest.pt --prompt "What" --temperature 0 --max_tokens 200
 """
 
 import argparse
+import os
 
 import torch
 
@@ -29,10 +30,20 @@ def load_checkpoint(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    if tokenizer_path is None:
-        # train.py checkpoints carry "train_config"; pretrain.py's don't, so this falls
-        # back to the (usually wrong) default — pass --tokenizer_path explicitly for those.
-        tokenizer_path = checkpoint.get("train_config", {}).get("data_dir", "data") + "/tokenizer.json"
+    auto_detected = tokenizer_path is None
+    if auto_detected:
+        # train.py, train_reasoning.py, and pretrain.py's configs ("train_config" or
+        # "pretrain_config" depending on stage) all store their own tokenizer_path
+        # directly -- read it back from whichever one the checkpoint has, so this
+        # resolves correctly regardless of which stage produced the checkpoint.
+        stage_config = checkpoint.get("train_config") or checkpoint.get("pretrain_config") or {}
+        tokenizer_path = stage_config.get("tokenizer_path", "checkpoints/tokenizer.json")
+    if not os.path.exists(tokenizer_path):
+        source = "auto-detected from the checkpoint" if auto_detected else "passed via --tokenizer_path"
+        raise FileNotFoundError(
+            f"Tokenizer not found at '{tokenizer_path}' ({source}). Pass the correct "
+            f"--tokenizer_path explicitly, e.g. --tokenizer_path checkpoints/tokenizer.json"
+        )
     tokenizer = BPETokenizer.load(tokenizer_path)
 
     print(f"Params     : {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")

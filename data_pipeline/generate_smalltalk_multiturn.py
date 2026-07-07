@@ -30,7 +30,7 @@ data_utils.flatten_conversation_to_qa() for callers that still want the legacy f
 {question, answer} shape (see build_smalltalk_demo_dataset.py).
 
 USAGE:
-    python generate_smalltalk_multiturn.py
+    python -m data_pipeline.generate_smalltalk_multiturn
 """
 
 import json

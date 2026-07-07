@@ -19,11 +19,11 @@ stage rather than a shared library. The two real differences from train.py:
    reasoning steps.
 
 HOW TO RUN:
-    python train_reasoning.py
-    python train_reasoning.py --max_iters 3000 --checkpoint_dir checkpoints/reasoning
+    python -m training.train_reasoning
+    python -m training.train_reasoning --max_iters 3000 --checkpoint_dir checkpoints/reasoning
 
     With Weights & Biases logging:
-        python train_reasoning.py --use_wandb --wandb_project my-project
+        python -m training.train_reasoning --use_wandb --wandb_project my-project
 """
 
 import argparse
@@ -40,8 +40,8 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from data_utils import create_dataloader, prepare_multitask_data, prepare_reasoning_data
-from eval_reasoning import print_summary, resolve_calc_ids, run_examples, summarize
 from model import ModelConfig, TinyLLM
+from training.eval_reasoning import print_summary, resolve_calc_ids, run_examples, summarize
 
 try:
     import wandb

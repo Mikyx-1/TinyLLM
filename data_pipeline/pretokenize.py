@@ -4,13 +4,13 @@ Step 1 — Prepare data for TinyLLM pretraining.
 USAGE (in order):
 
     # Train the BPE tokenizer on your raw corpus:
-    python pretokenize.py --train_tokenizer --corpus_dir data/raw_text
+    python -m data_pipeline.pretokenize --train_tokenizer --corpus_dir data/raw_text
 
     # Tokenize the corpus to fast binary files:
-    python pretokenize.py --corpus_dir data/raw_text --out_dir data/tokenized
+    python -m data_pipeline.pretokenize --corpus_dir data/raw_text --out_dir data/tokenized
 
     # Then pretrain:
-    python pretrain.py --corpus_dir data/tokenized
+    python -m training.pretrain --corpus_dir data/tokenized
 """
 
 import argparse
@@ -63,7 +63,7 @@ def train_tokenizer(corpus_dir: str, tokenizer_path: str, vocab_size: int):
     os.makedirs(os.path.dirname(tokenizer_path) or ".", exist_ok=True)
     tok.save(tokenizer_path)
     print(f"Saved tokenizer → {tokenizer_path}")
-    print(f"Next: python pretokenize.py --corpus_dir {corpus_dir}")
+    print(f"Next: python -m data_pipeline.pretokenize --corpus_dir {corpus_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ def pretokenize(corpus_dir: str, tokenizer_path: str, out_dir: str):
     print(f"  Time         : {elapsed:.1f}s  ({total_tokens/elapsed:,.0f} tok/s)")
     print(f"  Stats        : {stats_path}")
     print(f"\nDone! Now run:")
-    print(f"  python pretrain.py --corpus_dir {out_dir}")
+    print(f"  python -m training.pretrain --corpus_dir {out_dir}")
 
 
 # ---------------------------------------------------------------------------

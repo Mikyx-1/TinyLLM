@@ -32,7 +32,7 @@ Also written, for backwards compatibility with earlier eval commands:
                                                independent of any run's held-out split.
 
 USAGE:
-    python generate_synthetic_reasoning.py
+    python -m data_pipeline.generate_synthetic_reasoning
 """
 
 import json

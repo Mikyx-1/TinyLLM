@@ -10,8 +10,8 @@ turns into the legacy single question/answer shape train.py's QA_TEMPLATE pipeli
 expects, generalizing what used to be a hand-written, fixed-at-2-turns string.
 
 USAGE:
-    python generate_smalltalk_multiturn.py   # produces data/smalltalk_multiturn.json
-    python build_smalltalk_demo_dataset.py   # produces data/smalltalk_demo.json
+    python -m data_pipeline.generate_smalltalk_multiturn   # produces data/smalltalk_multiturn.json
+    python -m data_pipeline.build_smalltalk_demo_dataset    # produces data/smalltalk_demo.json
 """
 
 import json
