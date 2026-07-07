@@ -369,8 +369,12 @@ torchrun --nproc_per_node=2 -m training.train \
     --batch_size 32 \
     --max_iters 5000 \
     --d_model 512 \
+    --n_heads 8 \
     --n_layers 8
 ```
+`d_model` must be divisible by `n_heads` (`model/config.py` validates this) — the
+default `n_heads` is 6, which doesn't divide 512, so raising `d_model` means picking
+a compatible `n_heads` too.
 
 ### Monitor training with Weights & Biases
 Both `train.py` (SFT) and `pretrain.py` support optional [W&B](https://wandb.ai) logging of train/val
