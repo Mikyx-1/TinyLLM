@@ -419,6 +419,17 @@ part of understanding how it works:
 - **Demo examples are held-out but few.** The `<CALC>` reasoning examples shown in the
   demo are unseen during training, but the held-out set is small — treat the demo as a
   qualitative illustration, not a statistically rigorous benchmark result.
+- **"Multi-turn" here means multiple exchanges, not real conversational memory.**
+  `data/smalltalk_multiturn.json` is built by cross-combining independent, self-contained
+  turns (see `generate_smalltalk_multiturn.py`'s docstring) specifically so each turn is
+  answerable on its own — none of them require the model to actually recall or reuse
+  something from an earlier turn. Teaching a model to genuinely track state across a
+  conversation (remember a name, resolve "it"/"that" back to something said earlier,
+  follow a multi-step task) takes large volumes of real or carefully human-curated
+  dialogue data — the kind of thing OpenAI/Anthropic/Google collect from actual product
+  usage or pay annotators to write at scale. That's a resource gap a small/independent
+  project can't synthesize its way around with templates alone, so it's out of scope
+  here rather than something this repo currently attempts.
 
 ---
 
